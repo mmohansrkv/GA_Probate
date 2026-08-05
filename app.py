@@ -163,7 +163,7 @@ def _extract_upload_to_dir(file_storage, dest_dir):
 # ─────────────────────────────────────────────────────────────────────────
 # Citation Search (live scrape) job
 # ─────────────────────────────────────────────────────────────────────────
-def _run_citation_search_job(job_id, input_path, compare_path, opts):
+def _run_citation_search_job(job_id, input_path, opts):
     def log(msg):
         _log(job_id, msg)
 
@@ -184,7 +184,6 @@ def _run_citation_search_job(job_id, input_path, compare_path, opts):
         "output_folder": os.path.join(job["dir"], "Output"),
         "offline_folder": os.path.join(job["dir"], "Offline"),
         "tool_input_folder": os.path.join(job["dir"], "Tool_Input"),
-        "compare_file": compare_path,
         "headless": opts.get("headless", True),
         "limit": opts.get("limit") or 0,
         "delay_seconds_minimum": opts.get("delay_min", 0),
@@ -230,10 +229,14 @@ def _run_validation_job(job_id, offline_dir, output_dir, input_dir):
 def api_citation_search():
     """multipart/form-data:
        input_file    (required) - .txt or .xlsx: County / Starting Date / Ending Date
-       compare_file  (optional) - existing case-number .xlsx to validate the scrape against
        headless      (optional, default true)
        limit         (optional) - only process the first N counties (testing)
        delay_min / delay_max (optional) - seconds to sleep between counties
+
+    Match/New/Missing case-number validation against an existing baseline
+    still runs automatically (see core.find_compare_file) if a case-number
+    workbook is sitting in the job's Tool Input folder — there's just no
+    per-request upload field for it anymore.
     """
     if not core.SELENIUM_AVAILABLE:
         return jsonify(error=("selenium is not installed in this deployment — "
@@ -248,11 +251,6 @@ def api_citation_search():
     request.files["input_file"].save(input_path)
     _archive_input_to_corp_share(input_path, job_id)
 
-    compare_path = None
-    if "compare_file" in request.files and request.files["compare_file"].filename:
-        compare_path = os.path.join(job["dir"], secure_filename(request.files["compare_file"].filename))
-        request.files["compare_file"].save(compare_path)
-
     opts = {
         "headless": request.form.get("headless", "true").lower() != "false",
         "limit": request.form.get("limit", type=int) or 0,
@@ -261,7 +259,7 @@ def api_citation_search():
     }
 
     t = threading.Thread(target=_run_citation_search_job,
-                          args=(job_id, input_path, compare_path, opts), daemon=True)
+                          args=(job_id, input_path, opts), daemon=True)
     t.start()
     return jsonify(job_id=job_id), 202
 
@@ -372,10 +370,6 @@ INDEX_HTML = """
         <div class="hint">Tab-separated .txt or Excel, same columns as your weekly county list. A copy is
         also archived to the corp share (<code>D:\\Mohan\\GA_Probate\\New\\Input Folder</code>) so it's
         available to the Validation tool, if that path is reachable from this server.</div>
-
-        <label>Compare / existing case-number file (optional .xlsx)</label>
-        <input type="file" name="compare_file">
-        <div class="hint">If provided, the scrape is checked against it for Match / New / Missing case numbers.</div>
 
         <div class="row">
           <div>
