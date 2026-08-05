@@ -24,6 +24,7 @@ and has no such requirement.
 
 import io
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -48,6 +49,53 @@ app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB uploads
 # since results are meant to be downloaded right after the run.
 DATA_ROOT = os.environ.get("LNGA_DATA_ROOT", "/tmp/lnga_jobs")
 os.makedirs(DATA_ROOT, exist_ok=True)
+
+# Corporate network share the desktop tool used to keep every uploaded
+# Input file on, so the Validation tool (which reads its own "Input Excel"
+# folder from that same share) always has the latest copy available. Same
+# path the desktop tool's Validation config used for INPUT_EXCEL_DIR.
+# Overridable via env var; on a cloud host like Render this path won't
+# exist, so the copy step below is always best-effort and never blocks
+# the actual Citation Search run if it fails.
+CORP_INPUT_ARCHIVE_DIR = os.environ.get(
+    "LNGA_CORP_INPUT_ARCHIVE_DIR", r"D:\Mohan\GA_Probate\New\Input Folder"
+)
+
+
+_WINDOWS_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:\\")
+
+
+def _archive_input_to_corp_share(input_path, job_id):
+    """Best-effort copy of the uploaded Citation Search input file onto the
+    corp network share so it's available to the Validation tool's Input
+    Excel folder. Never raises — logs success or the reason it was
+    skipped into the job log.
+
+    On a non-Windows host (e.g. a Linux container on Render), a
+    'D:\\...' path isn't a real filesystem location — os.makedirs() on
+    Linux would happily create a bogus local folder literally named
+    'D:\\Mohan\\...' instead of failing, which would be misleading. So
+    that case is detected up front and reported as a skip rather than
+    attempted."""
+    if os.name != "nt" and _WINDOWS_DRIVE_PATH_RE.match(CORP_INPUT_ARCHIVE_DIR):
+        _log(job_id, f"[INFO] Skipped corp-share archive — "
+                      f"'{CORP_INPUT_ARCHIVE_DIR}' is a Windows path and this "
+                      f"server isn't Windows, so it isn't a real location here "
+                      f"(only relevant when running on the office network / a "
+                      f"Windows host with that drive mapped). Continuing with the run.")
+        return None
+    try:
+        os.makedirs(CORP_INPUT_ARCHIVE_DIR, exist_ok=True)
+        dest = os.path.join(CORP_INPUT_ARCHIVE_DIR, os.path.basename(input_path))
+        shutil.copy2(input_path, dest)
+        _log(job_id, f"Archived input file to corp share -> {dest}")
+        return dest
+    except OSError as e:
+        _log(job_id, f"[WARNING] Could not archive input file to corp share "
+                      f"'{CORP_INPUT_ARCHIVE_DIR}' ({type(e).__name__}: {e}) — "
+                      f"this is expected if that path isn't reachable from this "
+                      f"host. Continuing with the run.")
+        return None
 
 # In-memory job registry: {job_id: {...}}. Fine for a single-process
 # deployment (Render's free/starter web service tier); if you scale to
@@ -198,6 +246,7 @@ def api_citation_search():
 
     input_path = os.path.join(job["dir"], secure_filename(request.files["input_file"].filename))
     request.files["input_file"].save(input_path)
+    _archive_input_to_corp_share(input_path, job_id)
 
     compare_path = None
     if "compare_file" in request.files and request.files["compare_file"].filename:
@@ -320,7 +369,9 @@ INDEX_HTML = """
       <form id="form-citation">
         <label>Input file (.txt or .xlsx — County / Starting Date / Ending Date)</label>
         <input type="file" name="input_file" required>
-        <div class="hint">Tab-separated .txt or Excel, same columns as your weekly county list.</div>
+        <div class="hint">Tab-separated .txt or Excel, same columns as your weekly county list. A copy is
+        also archived to the corp share (<code>D:\\Mohan\\GA_Probate\\New\\Input Folder</code>) so it's
+        available to the Validation tool, if that path is reachable from this server.</div>
 
         <label>Compare / existing case-number file (optional .xlsx)</label>
         <input type="file" name="compare_file">
