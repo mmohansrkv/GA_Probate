@@ -138,6 +138,26 @@ curl https://<your-render-url>/api/jobs/<job_id>
 curl -OJ https://<your-render-url>/api/jobs/<job_id>/download/result_workbook
 ```
 
+## Corp share archiving (Citation Search input files)
+
+Every file uploaded through the Citation Search page's **Input file** field
+is also best-effort copied to a corp network share — by default
+`D:\Mohan\GA_Probate\New\Input Folder`, the same path the desktop tool's
+Validation config used for `INPUT_EXCEL_DIR` — so the Validation tool
+always has the latest input file available without a manual copy step.
+
+- Override the destination with the `LNGA_CORP_INPUT_ARCHIVE_DIR` env var
+  (already wired up in `render.yaml`).
+- This is **best-effort and non-blocking**: if the path isn't reachable
+  from wherever the app is running (which it won't be from Render's public
+  cloud unless you've set up private networking to the office LAN), the
+  Citation Search run still proceeds normally — you'll just see a
+  `[WARNING]` line in the job log instead of an `Archived input file to
+  corp share ->` line.
+- Running the app directly on a machine with that drive mapped (e.g. a
+  Windows box on the office network, via `python app.py` or Docker with
+  the share mounted in) makes the archive step succeed.
+
 ## Known limitations vs. the desktop tool
 
 - Jobs are tracked in an in-memory dict — fine for a single container
