@@ -14,4 +14,13 @@ services:
         value: /usr/bin/chromium
       - key: CHROMEDRIVER_PATH
         value: /usr/bin/chromedriver
+      # Corp network share the Citation Search page archives each uploaded
+      # input file to (matches the desktop tool's Validation INPUT_EXCEL_DIR).
+      # This path is on the office LAN, not reachable from Render's public
+      # cloud by default — the archive step degrades gracefully (logs a
+      # warning, doesn't fail the run) unless you set up private networking
+      # (e.g. a VPN/Site-to-Site tunnel) to the office network and point
+      # this at a share reachable from there.
+      - key: LNGA_CORP_INPUT_ARCHIVE_DIR
+        value: D:\Mohan\GA_Probate\New\Input Folder
     autoDeploy: true
