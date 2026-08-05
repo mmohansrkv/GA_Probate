@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: lnga-probate-courts
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter          # bump to standard+ if scrapes/validations time out on free/starter CPU
+    healthCheckPath: /healthz
+    envVars:
+      - key: LNGA_DATA_ROOT
+        value: /tmp/lnga_jobs
+      # Selenium build_driver() reads these to use the Chromium/chromedriver
+      # baked into the image instead of trying to download a browser.
+      - key: CHROME_BIN
+        value: /usr/bin/chromium
+      - key: CHROMEDRIVER_PATH
+        value: /usr/bin/chromedriver
+    autoDeploy: true
