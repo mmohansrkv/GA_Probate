@@ -1641,14 +1641,6 @@ def run_live_pipeline(cfg, log, on_done):
             raise RuntimeError(
                 "selenium is not installed. Install it with:  pip install selenium")
 
-        log("=" * 62)
-        log("  LNGA Probate Courts — Live Search")
-        log("=" * 62)
-        log(f"  Input Excel     : {cfg['input_file']}")
-        log(f"  Output folder   : {cfg['output_folder']}")
-        log(f"  Offline folder  : {cfg['offline_folder']}")
-        log(f"  Tool Input      : {cfg['tool_input_folder']}")
-
         county_rows = load_input_file(cfg["input_file"])
         limit = cfg.get("limit") or 0
         if limit:
@@ -1656,8 +1648,8 @@ def run_live_pipeline(cfg, log, on_done):
         if not county_rows:
             raise RuntimeError(f"No county rows parsed from: {cfg['input_file']}")
 
-        log(f"  Counties to process : {len(county_rows)}")
-        log(f"  Browser mode        : {'headless' if cfg.get('headless', True) else 'visible'}\n")
+        log(f"Starting Citation Search — {len(county_rows)} "
+            f"count{'y' if len(county_rows) == 1 else 'ies'} to process.")
 
         ensure_folder(cfg["offline_folder"])
         driver = build_driver(headless=cfg.get("headless", True))
