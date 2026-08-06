@@ -1,26 +1,18 @@
 services:
   - type: web
-    name: lnga-probate-courts
-    runtime: docker
+    name: lnga-probate-courts-tool
+    env: docker
     dockerfilePath: ./Dockerfile
-    plan: starter          # bump to standard+ if scrapes/validations time out on free/starter CPU
+    plan: starter          # Chrome needs more than the free plan's 512MB RAM
     healthCheckPath: /healthz
     envVars:
-      - key: LNGA_DATA_ROOT
-        value: /tmp/lnga_jobs
-      # Selenium build_driver() reads these to use the Chromium/chromedriver
-      # baked into the image instead of trying to download a browser.
+      - key: DATA_DIR
+        value: /var/data
       - key: CHROME_BIN
-        value: /usr/bin/chromium
-      - key: CHROMEDRIVER_PATH
-        value: /usr/bin/chromedriver
-      # Corp network share the Citation Search page archives each uploaded
-      # input file to (matches the desktop tool's Validation INPUT_EXCEL_DIR).
-      # This path is on the office LAN, not reachable from Render's public
-      # cloud by default — the archive step degrades gracefully (logs a
-      # warning, doesn't fail the run) unless you set up private networking
-      # (e.g. a VPN/Site-to-Site tunnel) to the office network and point
-      # this at a share reachable from there.
-      - key: LNGA_CORP_INPUT_ARCHIVE_DIR
-        value: D:\Mohan\GA_Probate\New\Input Folder
-    autoDeploy: true
+        value: /usr/bin/google-chrome-stable
+      - key: PYTHONUNBUFFERED
+        value: "1"
+    disk:
+      name: lnga-probate-data
+      mountPath: /var/data
+      sizeGB: 5
