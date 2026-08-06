@@ -1,87 +1,85 @@
 """
-core.py — LNGA GA Probate Courts, headless core logic.
+core.py
+====================================================================
+LNGA / GA Probate Courts Tool — core logic (web-service edition)
+====================================================================
 
-Ported without behavioral changes from LNGA_ProbateCourts_Combined_01.py:
-all Tkinter GUI code (CitationSearchApp, ValidationApp, App) has been
-removed. Every scraping / parsing / Excel-writing function below is the
-same code that ran inside the desktop app, just called directly from
-app.py (Flask) instead of from tkinter button callbacks.
+This module contains the full, GUI-free business logic of the original
+LNGA_ProbateCourts_Combined_Tool.py desktop app:
 
-Two entry points other modules should use:
-    run_live_pipeline(cfg, log, on_done)   -> Citation Search (live scrape)
-    run_validation(offline_dir, output_dir, input_dir, result_base_dir)
-                                            -> Validation tool
+  1. CITATION SEARCH — drives a headless Chrome browser (Selenium)
+     against https://georgiaprobaterecords.com/Traffic/SearchCitations.aspx
+     for every County/Start/End row in an input file, scrapes the results
+     grid, and writes an "Output" workbook of every case number found
+     plus a "Result" (Match/New/Missing) workbook.
+
+  2. VALIDATION — compares offline HTML case files against an Output
+     Excel and flags field-by-field mismatches, plus Input-vs-Output and
+     same-Case#/different-County cross-checks.
+
+Nothing in this file talks to a UI toolkit. Every long-running job takes
+a `log(message)` callback so callers (app.py's Flask routes / background
+threads) can stream progress however they like (SSE, log file, etc).
+====================================================================
 """
 
 import os
 import re
 import sys
-import time
 import glob
+import time
 import logging
 import traceback
 from datetime import datetime
 
 import pandas as pd
 
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
-
-from bs4 import BeautifulSoup
-BS4_AVAILABLE = True
+try:
+    import openpyxl
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+except ImportError:
+    print("\u274c openpyxl is required. Install it with:  pip install openpyxl")
+    sys.exit(1)
 
 try:
-    from selenium import webdriver
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.common.keys import Keys
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.common.exceptions import (
-        TimeoutException, NoSuchElementException, StaleElementReferenceException
-    )
-    SELENIUM_AVAILABLE = True
+    from bs4 import BeautifulSoup
 except ImportError:
-    SELENIUM_AVAILABLE = False
-
+    print("\u274c beautifulsoup4 is required. Install it with:  pip install beautifulsoup4")
+    sys.exit(1)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-log = logging.getLogger("lnga_probate")
-if not log.handlers:
-    _h = logging.StreamHandler()
-    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    log.addHandler(_h)
-    log.setLevel(logging.INFO)
+# Base data directory. On Render, DATA_DIR should point at the mounted disk
+# (see render.yaml) so uploaded/generated files survive across requests and
+# deploys. Locally it defaults to a "data" folder next to this file.
+DATA_DIR = os.environ.get("DATA_DIR", os.path.join(SCRIPT_DIR, "data"))
 
-# ─────────────────────────────────────────────────────────────────────────
-# CONFIG — defaults (all overridable by the caller; folders auto-created).
-# On the web app these are just scratch/staging directories under /tmp or
-# a mounted disk — app.py passes real per-request paths in, these are only
-# used as fallbacks.
-# ─────────────────────────────────────────────────────────────────────────
-INPUT_FOLDER       = os.environ.get("LNGA_INPUT_FOLDER", "/tmp/lnga/Input")
-OUTPUT_FOLDER       = os.environ.get("LNGA_OUTPUT_FOLDER", "/tmp/lnga/Output")
-OFFLINE_FOLDER       = os.environ.get("LNGA_OFFLINE_FOLDER", "/tmp/lnga/Offline")
-TOOL_INPUT_FOLDER   = os.environ.get("LNGA_TOOL_INPUT_FOLDER", "/tmp/lnga/Tool_Input")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-7s  %(message)s",
+    datefmt="%H:%M:%S",
+)
 
+log = logging.getLogger("lnga_probate_tool")
 
-OFFLINE_HTML_DIR = os.environ.get("LNGA_VALIDATION_OFFLINE_DIR", "/tmp/lnga/Validation/Offline")
-OUTPUT_EXCEL_DIR = os.environ.get("LNGA_VALIDATION_OUTPUT_DIR", "/tmp/lnga/Validation/Output")
-INPUT_EXCEL_DIR  = os.environ.get("LNGA_VALIDATION_INPUT_DIR", "/tmp/lnga/Validation/Input")
-RESULT_BASE_DIR  = os.environ.get("LNGA_VALIDATION_RESULT_DIR", "/tmp/lnga/Validation")
+OFFLINE_HTML_DIR = os.path.join(DATA_DIR, "Validation", "Offline")
+
+OUTPUT_EXCEL_DIR = os.path.join(DATA_DIR, "Validation", "Output")
+
+INPUT_EXCEL_DIR  = os.path.join(DATA_DIR, "Validation", "Input Folder")
+
+RESULT_BASE_DIR  = os.path.join(DATA_DIR, "Validation", "Result")
 
 MAX_ROW_INDEX = 50   # HTML citation rows are indexed _0 through _50 inclusive
 
-# Field order -- this drives the exact column order in the result sheet,
-# matching your Output Excel's header pattern.
 FIELD_ORDER = [
     "Case #", "County", "Violation Date", "Court Date", "Name", "Address",
     "Race", "Sex", "Citation Number", "Code", "Description", "Fine",
     "Disposition", "Disposition Date", "Sentence",
 ]
 
-# --- HTML tag (control id SUFFIX) map for single (non-repeating, case-level) fields ---
 SINGLE_FIELD_SUFFIXES = {
     "County":          "_lblCourtName",
     "Case #":          "_lblCaseNo",
@@ -93,7 +91,6 @@ SINGLE_FIELD_SUFFIXES = {
     "Sex":             "_lblSex",
 }
 
-# --- HTML tag (control id PREFIX, index appended) map for repeating (per-citation) fields ---
 ROW_FIELD_PREFIXES = {
     "Citation Number": "_lblCitationNo_",
     "Code":            "_lblCitCode_",
@@ -105,11 +102,9 @@ ROW_FIELD_PREFIXES = {
 }
 
 SINGLE_FIELDS = set(SINGLE_FIELD_SUFFIXES.keys())
+
 ROW_FIELDS = set(ROW_FIELD_PREFIXES.keys())
 
-# --- Column header candidates to look for in the OUTPUT excel, for each field. ---
-# The script first tries "<field> (Output)" (matching your exact header pattern);
-# if that's not found it falls back to these synonyms as a bare column name.
 OUTPUT_COLUMN_CANDIDATES = {
     "Case #":            ["case #", "case no", "case number"],
     "County":            ["county", "court name"],
@@ -128,45 +123,880 @@ OUTPUT_COLUMN_CANDIDATES = {
     "Sentence":          ["sentence", "sentencing"],
 }
 
-# --- Column header candidates to look for in the INPUT excel ---
 INPUT_COLUMN_CANDIDATES = {
     "Case #": ["case #", "case no", "case number"],
     "County": ["county", "court name"],
 }
 
-# ─────────────────────────────────────────────────────────────────────────
-# CONFIG — defaults (all overridable per-request from app.py, all auto-created)
-# ─────────────────────────────────────────────────────────────────────────
+def normalize_key(value):
+    """Normalize a value for use as a join key (case #, county names etc)."""
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if s.lower() in ("nan", "none", "nat"):
+        return ""
+    s = re.sub(r"\s+", " ", s).upper()
+    return s
+
+def normalize_header(value):
+    """Normalize a column header for fuzzy matching (lowercase, strip punctuation/spaces)."""
+    s = str(value).strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "", s)
+    return s
+
+NO_RECORDS_MARKERS = (
+    "no records to display",
+    "no records found",
+    "no record found",
+    "no results found",
+    "no data to display",
+    "no matching records found",
+)
+
+def is_no_records_placeholder(value):
+    """True if value is one of the site's 'zero results for this county'
+    placeholder strings (e.g. 'No records to display.') rather than an
+    actual Case #. These show up as a single placeholder row per empty
+    county in the Input Excel and must NOT be treated as a real case
+    that is 'New'/'Not Found' in the Output."""
+    s = normalize_value_for_compare(value).lower().rstrip(".")
+    return s in NO_RECORDS_MARKERS
+
+def normalize_value_for_compare(value):
+    """Normalize a field value before comparing HTML vs Excel (trim, collapse spaces, blank-safe)."""
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if s.lower() in ("nan", "none", "nat"):
+        return ""
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def find_output_column(df_columns, field):
+    """
+    Find the Output Excel column for a given field. Tries, in order:
+        1. exact "<field> (Output)"  (your standard header pattern)
+        2. "<field> (Output)" using each synonym from OUTPUT_COLUMN_CANDIDATES
+        3. bare synonym column names (no "(Output)" suffix), as a fallback
+    Returns the actual column name, or None if nothing matches.
+    """
+    norm_map = {normalize_header(c): c for c in df_columns}
+
+    exact_key = normalize_header(f"{field} (Output)")
+    if exact_key in norm_map:
+        return norm_map[exact_key]
+
+    for cand in OUTPUT_COLUMN_CANDIDATES.get(field, []):
+        key = normalize_header(f"{cand} (Output)")
+        if key in norm_map:
+            return norm_map[key]
+
+    for cand in OUTPUT_COLUMN_CANDIDATES.get(field, [field]):
+        key = normalize_header(cand)
+        if key in norm_map:
+            return norm_map[key]
+
+    return None
+
+def find_column(df_columns, candidates):
+    """Generic fuzzy header match (used for the Input Excel, which has no (Output) suffix)."""
+    norm_map = {normalize_header(c): c for c in df_columns}
+    for cand in candidates:
+        norm_cand = normalize_header(cand)
+        if norm_cand in norm_map:
+            return norm_map[norm_cand]
+    return None
+
+def get_text_by_id_suffix(soup, suffix):
+    """Find the first element whose id ATTRIBUTE ENDS WITH suffix, return its text."""
+    pattern = re.compile(re.escape(suffix) + r"$")
+    el = soup.find(id=pattern)
+    if el is None:
+        return ""
+    return el.get_text(separator=" ", strip=True)
+
+COUNTY_SUFFIX_PATTERN = re.compile(r"\s*County\s+Probate\s+Court\s*$", re.IGNORECASE)
+
+def clean_county_value(value):
+    """Strip a trailing 'County Probate Court' from a County value, e.g.
+    'Fulton County Probate Court' -> 'Fulton'."""
+    if not value:
+        return value
+    return COUNTY_SUFFIX_PATTERN.sub("", value).strip()
+
+import unicodedata
+
+_DO_NOT_USE_PATTERNS = [
+    r"DON'?T\s*USE\s*\*",
+    r"\*{1,2}\s*DO\s*NOT\s*USE\s*\*{1,2}",
+    r"::\s*DO\s*NOT\s*USE\s*::",
+]
+
+_DO_NOT_USE_RE = re.compile("|".join(_DO_NOT_USE_PATTERNS), re.IGNORECASE)
+
+_JUNK_CHARS_RE = re.compile(r"[?€]")
+
+def strip_junk_chars(value):
+    """Cleans up any extracted column value:
+      - normalizes accented Unicode letters (diacritics) to plain ASCII
+        (e.g. "Á" -> "A", "é" -> "e", "Ñ" -> "N")
+      - removes any literal '?' and '€' characters
+    Safe to call on non-strings (returns them unchanged) or empty values."""
+    if value is None:
+        return value
+    if not isinstance(value, str):
+        return value
+    s = unicodedata.normalize("NFKD", value)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = _JUNK_CHARS_RE.sub("", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def clean_name_value(name):
+    """Clean up a Name/Offender field:
+      - normalizes accented characters to plain ASCII, strips '?' / '€'
+        (via strip_junk_chars, same as every other column)
+      - strips 'do not use' style flags
+    Safe to call on an empty string."""
+    if not name:
+        return name
+    s = str(name).strip()
+    if not s:
+        return s
+
+    # Strip "do not use" flags first (before accents are stripped, in
+    # case a flag ever contains an accented character).
+    s = _DO_NOT_USE_RE.sub("", s)
+
+    # Diacritics + '?' / '€' -- same cleanup as every other column.
+    s = strip_junk_chars(s)
+
+    # Clean up stray punctuation/whitespace left behind by the strip.
+    s = s.strip(" *:-")
+    s = re.sub(r"\s+", " ", s).strip()
+
+    return s
+
+def parse_filename_county_case(filepath):
+    """The offline HTML file is saved as '<COUNTY>_<CASE#>.html'
+    (e.g. 'BUTTS_25T1999.html'). Some downloads have a numeric upload-id
+    prefix in front of that (e.g. '1785921572890_BUTTS_25T1999.html') -
+    that leading '<digits>_' is stripped before splitting.
+    Returns (county, case_no) as upper-case strings, ('','') if the name
+    doesn't follow the pattern."""
+    stem = os.path.splitext(os.path.basename(filepath))[0]
+    stem = re.sub(r"^\d+_", "", stem)  # strip leading numeric upload-id prefix, if any
+    parts = stem.split("_", 1)
+    if len(parts) == 2 and parts[0] and parts[1]:
+        return parts[0].strip().upper(), parts[1].strip().upper()
+    return "", ""
+
+def extract_case_from_html(filepath):
+    """Parse one offline HTML case file and return a dict of extracted data."""
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+        html = f.read()
+    soup = BeautifulSoup(html, "html.parser")
+
+    case = {"_source_file": os.path.basename(filepath)}
+
+    for field, suffix in SINGLE_FIELD_SUFFIXES.items():
+        case[field] = strip_junk_chars(get_text_by_id_suffix(soup, suffix))
+
+    # "Fulton County Probate Court" -> "Fulton"
+    case["County"] = clean_county_value(case.get("County", ""))
+
+    # Fix mangled accents / strip "DO NOT USE" flags on the offender name.
+    case["Name"] = clean_name_value(case.get("Name", ""))
+
+    # File name is expected to be '<COUNTY>_<CASE#>.html' - used as a
+    # cross-check against what was actually extracted from inside the page,
+    # and as a fallback for County/Case # if the page didn't yield one.
+    fname_county, fname_case = parse_filename_county_case(filepath)
+    case["_filename_county"] = fname_county
+    case["_filename_case"] = fname_case
+    if not case.get("County"):
+        case["County"] = fname_county
+    if not case.get("Case #"):
+        case["Case #"] = fname_case
+
+    citations = []
+    for i in range(MAX_ROW_INDEX + 1):
+        row = {}
+        has_value = False
+        for field, prefix in ROW_FIELD_PREFIXES.items():
+            val = strip_junk_chars(get_text_by_id_suffix(soup, f"{prefix}{i}"))
+            row[field] = val
+            if val:
+                has_value = True
+        row["_index"] = i
+        if has_value:
+            citations.append(row)
+
+    case["Citations"] = citations
+    return case
+
+def load_all_html_cases(html_dir):
+    """Load and extract every single-case .html/.htm file in html_dir.
+    Search-results LIST pages (e.g. 'BUTTS_6-9-2026_6-15-2026_List_3.html'
+    or 'BUTTS_LIST_3.html') are skipped -- they hold a whole page of
+    citation rows, not one case, and would otherwise get misparsed as a
+    case file (the date/list-number portion getting read as a bogus
+    Case #), producing false 'Mismatch (Case #, County)' rows."""
+    files = sorted(
+        glob.glob(os.path.join(html_dir, "*.html"))
+        + glob.glob(os.path.join(html_dir, "*.htm"))
+    )
+    if not files:
+        log.warning("No .html/.htm files found in %s", html_dir)
+    cases = []
+    skipped_list_files = 0
+    for fp in files:
+        if is_offline_list_filename(fp):
+            skipped_list_files += 1
+            continue
+        try:
+            cases.append(extract_case_from_html(fp))
+        except Exception as e:
+            log.error("Failed to parse %s: %s", fp, e)
+    if skipped_list_files:
+        log.info("Skipped %d search-results LIST page(s) (not single-case files) in %s",
+                  skipped_list_files, html_dir)
+    log.info("Extracted %d case(s) from %d HTML file(s) in %s", len(cases), len(files), html_dir)
+    return cases
+
+def get_output_excel_name_tag(excel_dir):
+    """Build a filename tag from the Output Excel file name(s) in excel_dir,
+    e.g. 'Fulton_Output' -> 'Fulton_Output'. If multiple output excel files
+    exist, their names are joined with '_'. Falls back to 'Output' if none found."""
+    files = sorted(
+        glob.glob(os.path.join(excel_dir, "*.xlsx"))
+        + glob.glob(os.path.join(excel_dir, "*.xls"))
+    )
+    files = [f for f in files if not os.path.basename(f).startswith("~$")]
+    if not files:
+        return "Output"
+    names = [os.path.splitext(os.path.basename(f))[0] for f in files]
+    tag = "_".join(names)
+    tag = re.sub(r"[^A-Za-z0-9_\-]+", "_", tag).strip("_")
+    return tag or "Output"
+
+def load_excel_folder(excel_dir):
+    """Read every .xlsx/.xls file in excel_dir into one combined DataFrame (all sheets, all files).
+    Skips Excel's hidden lock/temp files (e.g. '~$Book1.xlsx'), which are created
+    while a workbook is open elsewhere and are not readable spreadsheets."""
+    files = sorted(
+        glob.glob(os.path.join(excel_dir, "*.xlsx"))
+        + glob.glob(os.path.join(excel_dir, "*.xls"))
+    )
+    files = [f for f in files if not os.path.basename(f).startswith("~$")]
+    if not files:
+        log.warning("No .xlsx/.xls files found in %s", excel_dir)
+        return pd.DataFrame()
+
+    frames = []
+    for fp in files:
+        try:
+            xls = pd.ExcelFile(fp)
+            for sheet in xls.sheet_names:
+                df = xls.parse(sheet, dtype=str)
+                df["_source_file"] = os.path.basename(fp)
+                df["_source_sheet"] = sheet
+                frames.append(df)
+        except Exception as e:
+            log.error("Failed to read %s: %s", fp, e)
+
+    if not frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    log.info("Loaded %d row(s) from %d excel file(s) in %s", len(combined), len(files), excel_dir)
+    return combined
+
+def resolve_output_columns(output_df):
+    """Resolve the actual Output Excel column name for every field, once."""
+    resolved = {}
+    for field in FIELD_ORDER:
+        resolved[field] = find_output_column(output_df.columns, field)
+    return resolved
+
+def case_composite_key(case_value, county_value):
+    """Build the composite grouping/lookup key used everywhere a case is
+    matched between HTML and Output/Input Excel: Case # + County. Using
+    Case # alone would wrongly merge two different cases that happen to
+    share the same Case # in two different counties (this DOES happen -
+    e.g. Case # 25T1999 exists in both Butts County and Harris County)."""
+    return f"{normalize_key(case_value)}||{normalize_key(county_value)}"
+
+def group_output_rows_by_case(output_df, case_col, county_col=None):
+    """Group Output Excel rows by (Case #, County) composite key, preserving
+    row order. Also returns a secondary case-# only index (case_key ->
+    list of composite keys seen) so callers can detect/fall back when a
+    Case # exists under more than one County."""
+    groups = {}
+    case_only_index = {}
+    for _, row in output_df.iterrows():
+        case_key = normalize_key(row.get(case_col, ""))
+        if not case_key:
+            continue
+        county_val = row.get(county_col, "") if county_col else ""
+        composite = case_composite_key(case_key, county_val)
+        groups.setdefault(composite, []).append(row)
+        case_only_index.setdefault(case_key, set()).add(composite)
+    return groups, case_only_index
+
+def pair_citations(html_citations, output_rows):
+    """
+    Pair each HTML citation with an Output Excel row (one row = one citation).
+    1) Exact match by normalized Citation Number where both sides have one.
+    2) Leftover citations/rows are paired by original order (position).
+    3) Any unmatched leftovers on either side are paired with None.
+    Returns a list of (html_citation_or_None, output_row_or_None) tuples.
+    """
+    html_remaining = list(html_citations)
+    output_remaining = list(output_rows)
+
+    # exact Citation Number match first
+    pairs = []
+    used_output_idx = set()
+    still_unmatched_html = []
+    for cit in html_remaining:
+        cit_no = normalize_key(cit.get("Citation Number", ""))
+        matched_idx = None
+        if cit_no:
+            for i, out_row in enumerate(output_remaining):
+                if i in used_output_idx:
+                    continue
+                out_cit_no = normalize_key(out_row.get("_Citation Number_resolved", ""))
+                if out_cit_no and out_cit_no == cit_no:
+                    matched_idx = i
+                    break
+        if matched_idx is not None:
+            pairs.append((cit, output_remaining[matched_idx]))
+            used_output_idx.add(matched_idx)
+        else:
+            still_unmatched_html.append(cit)
+
+    unused_output = [r for i, r in enumerate(output_remaining) if i not in used_output_idx]
+
+    # positional pairing for the rest
+    for i in range(max(len(still_unmatched_html), len(unused_output))):
+        h = still_unmatched_html[i] if i < len(still_unmatched_html) else None
+        o = unused_output[i] if i < len(unused_output) else None
+        pairs.append((h, o))
+
+    if not pairs:
+        # no citations on either side -- still emit one blank citation slot
+        pairs = [(None, None)]
+
+    return pairs
+
+def field_match_status(tool_val, output_val):
+    t = normalize_value_for_compare(tool_val)
+    o = normalize_value_for_compare(output_val)
+    if t == "" and o == "":
+        return "Match"  # nothing to compare -- treated as match
+    return "Match" if t.upper() == o.upper() else "Mismatch"
+
+def build_validation_rows(html_cases, output_df):
+    """
+    Build the main result rows: one row per (case, citation) pair, with
+    "<Field> (Tool_Input)", "<Field> (Output)", "<Field> Match" for every
+    field in FIELD_ORDER, plus "Row Status".
+    """
+    if output_df.empty:
+        log.warning("Output Excel is empty/missing - skipping field validation.")
+        return [], []
+
+    output_cols = resolve_output_columns(output_df)
+    case_col = output_cols.get("Case #")
+    if case_col is None:
+        raise ValueError(
+            "Could not find a 'Case # (Output)' (or fallback) column in the Output Excel. "
+            "Check OUTPUT_COLUMN_CANDIDATES['Case #']."
+        )
+
+    # pre-resolve the citation number column so pair_citations can use it
+    cit_no_col = output_cols.get("Citation Number")
+    county_col = output_cols.get("County")
+
+    output_groups, case_only_index = group_output_rows_by_case(output_df, case_col, county_col)
+    # attach a normalized helper key for citation-number matching
+    for key, rows in output_groups.items():
+        for row in rows:
+            row["_Citation Number_resolved"] = row.get(cit_no_col, "") if cit_no_col else ""
+
+    result_rows = []
+    case_summary = []
+
+    for html_case in html_cases:
+        case_only_key = normalize_key(html_case.get("Case #", ""))
+        county_key = normalize_key(html_case.get("County", ""))
+        composite_key = case_composite_key(case_only_key, county_key)
+
+        output_rows_for_case = output_groups.get(composite_key, [])
+        county_note = ""
+
+        if not output_rows_for_case:
+            # No exact (Case #, County) match. If this Case # exists in the
+            # Output under a DIFFERENT county, that is the "same case #,
+            # different county" situation - do NOT silently borrow those
+            # rows (that's the bug this fix addresses). Just flag it.
+            other_composites = case_only_index.get(case_only_key, set())
+            other_counties = sorted({
+                c.split("||", 1)[1] for c in other_composites if c != composite_key
+            })
+            if other_counties:
+                county_note = (
+                    f"Case # {html_case.get('Case #','')} exists in Output under different "
+                    f"County/Counties: {', '.join(other_counties)} (HTML County: "
+                    f"{html_case.get('County','') or '(blank)'})"
+                )
+                log.warning(county_note)
+
+        found_in_output = bool(output_rows_for_case)
+
+        pairs = pair_citations(html_case.get("Citations", []), output_rows_for_case)
+
+        row_mismatch_count = 0
+        for html_cit, out_row in pairs:
+            row_data = {}
+            mismatched_fields = []
+
+            for field in FIELD_ORDER:
+                if field in SINGLE_FIELDS:
+                    tool_val = html_case.get(field, "")
+                else:
+                    tool_val = html_cit.get(field, "") if html_cit else ""
+
+                output_val = out_row.get(output_cols.get(field), "") if (out_row is not None and output_cols.get(field)) else ""
+
+                status = field_match_status(tool_val, output_val)
+                if status == "Mismatch":
+                    mismatched_fields.append(field)
+
+                row_data[f"{field} (Tool_Input)"] = normalize_value_for_compare(tool_val)
+                row_data[f"{field} (Output)"] = normalize_value_for_compare(output_val)
+                row_data[f"{field} Match"] = status
+
+            if mismatched_fields:
+                row_data["Row Status"] = "Mismatch (" + ", ".join(mismatched_fields) + ")"
+                row_mismatch_count += 1
+            else:
+                row_data["Row Status"] = "Match"
+
+            row_data["_source_html_file"] = html_case.get("_source_file", "")
+            result_rows.append(row_data)
+
+        case_summary.append({
+            "Case #": html_case.get("Case #", ""),
+            "County": html_case.get("County", ""),
+            "Rows Compared": len(pairs),
+            "Rows Matched": len(pairs) - row_mismatch_count if found_in_output else 0,
+            "Rows Mismatched": row_mismatch_count if found_in_output else len(pairs),
+            "Overall Status": "Match" if (found_in_output and row_mismatch_count == 0) else
+                              ("Case Not Found in Output Excel" if not found_in_output else "Mismatch"),
+            "Source HTML File": html_case.get("_source_file", ""),
+            "Case# Same # Diff County Note": county_note,
+        })
+
+    return result_rows, case_summary
+
+def build_case_county_check(html_cases, output_df):
+    """
+    Cross-check sheet: for every distinct Case # seen (in the offline HTML
+    files and/or the Output Excel), list every County it shows up under on
+    each side. Flags any Case # that appears under MORE THAN ONE County -
+    this is the 'Case number same but county different' check. It is not
+    automatically wrong (the same Case # legitimately recurs across
+    different counties' probate courts), but it needs a human glance to
+    confirm it's not a data-entry mix-up.
+    """
+    case_data = {}  # case_key -> {"html": set(), "output": set(), "html_files": set()}
+
+    for c in html_cases:
+        case_key = normalize_key(c.get("Case #", ""))
+        if not case_key:
+            continue
+        entry = case_data.setdefault(case_key, {"html": set(), "output": set(), "html_files": set()})
+        county = normalize_value_for_compare(c.get("County", "")).upper()
+        if county:
+            entry["html"].add(county)
+        if c.get("_source_file"):
+            entry["html_files"].add(c["_source_file"])
+
+    if output_df is not None and not output_df.empty:
+        output_cols = resolve_output_columns(output_df)
+        case_col = output_cols.get("Case #")
+        county_col = output_cols.get("County")
+        if case_col:
+            for _, row in output_df.iterrows():
+                case_key = normalize_key(row.get(case_col, ""))
+                if not case_key:
+                    continue
+                entry = case_data.setdefault(case_key, {"html": set(), "output": set(), "html_files": set()})
+                county = normalize_value_for_compare(row.get(county_col, "")).upper() if county_col else ""
+                if county:
+                    entry["output"].add(county)
+
+    rows = []
+    for case_key in sorted(case_data.keys()):
+        entry = case_data[case_key]
+        html_counties = sorted(entry["html"])
+        output_counties = sorted(entry["output"])
+        flags = []
+        if len(html_counties) > 1:
+            flags.append("Same Case # under multiple Counties in OFFLINE HTML")
+        if len(output_counties) > 1:
+            flags.append("Same Case # under multiple Counties in OUTPUT EXCEL")
+        if html_counties and output_counties and set(html_counties) != set(output_counties):
+            flags.append("HTML County set differs from Output County set")
+        status = "; ".join(flags) if flags else "OK"
+        rows.append({
+            "Case #": case_key,
+            "Counties in Offline HTML": ", ".join(html_counties),
+            "Counties in Output Excel": ", ".join(output_counties),
+            "Source HTML File(s)": ", ".join(sorted(entry["html_files"])),
+            "Status": status,
+        })
+
+    columns = ["Case #", "Counties in Offline HTML", "Counties in Output Excel",
+               "Source HTML File(s)", "Status"]
+    df = pd.DataFrame(rows)
+    if df.empty:
+        df = pd.DataFrame(columns=columns)
+    else:
+        df = df[columns]
+    return df
+
+def run_input_vs_output_validation(input_df, output_df):
+    """Returns (comparison_df, not_found_count).
+    not_found_count = number of "No records to display." placeholder rows in
+    the Input Excel (counties the source site returned zero cases for). Those
+    rows are NOT real cases, so they are excluded from comparison_df / the
+    New Case count, but they ARE counted here so the GUI can surface them
+    under NOT FOUND instead of silently dropping them."""
+    if input_df.empty:
+        log.warning("Input Excel is empty/missing - skipping input-vs-output validation.")
+        return pd.DataFrame(), 0
+    if output_df.empty:
+        log.warning("Output Excel is empty/missing - skipping input-vs-output validation.")
+        return pd.DataFrame(), 0
+
+    in_case_col = find_column(input_df.columns, INPUT_COLUMN_CANDIDATES["Case #"])
+    in_county_col = find_column(input_df.columns, INPUT_COLUMN_CANDIDATES["County"])
+
+    output_cols = resolve_output_columns(output_df)
+    out_case_col = output_cols.get("Case #")
+    out_county_col = output_cols.get("County")
+
+    if in_case_col is None or out_case_col is None:
+        raise ValueError("Could not locate a 'Case #' column in the Input and/or Output Excel.")
+
+    # Keep ALL Output rows per Case # (not just the first) - a Case # can
+    # legitimately appear under more than one County, and collapsing to a
+    # single row per Case # was silently discarding the other county's data
+    # and could report a false County "Mismatch".
+    output_lookup = {}
+    for _, row in output_df.iterrows():
+        key = normalize_key(row.get(out_case_col, ""))
+        if not key:
+            continue
+        output_lookup.setdefault(key, []).append(row)
+
+    results = []
+    not_found_count = 0
+    for _, in_row in input_df.iterrows():
+        in_case = in_row.get(in_case_col, "")
+        key = normalize_key(in_case)
+
+        if not key:
+            # blank Case # in the Input Excel - nothing to compare, skip this row entirely
+            continue
+
+        if is_no_records_placeholder(in_case):
+            # source site's "no cases found for this county" placeholder row -
+            # not a real case, so it must not be counted as New Case. Still
+            # written into the result sheet (and counted) as "Not Found" so
+            # it's visible in the Excel, not just the console/log.
+            not_found_count += 1
+            county_for_msg = in_row.get(in_county_col, "") if in_county_col else ""
+            msg = f"'No records to display.' placeholder row for county={county_for_msg} -> counted as Not Found"
+            log.info(msg)
+            results.append({
+                "Case #": in_case,
+                "Input County": county_for_msg,
+                "Output County": "",
+                "Case # Status": "Not Found",
+                "County Status": "Not Found",
+                "Source Input File": in_row.get("_source_file", ""),
+                "Notes": msg,
+            })
+            continue
+
+        in_county = in_row.get(in_county_col, "") if in_county_col else ""
+
+        out_candidates = output_lookup.get(key, [])
+        if not out_candidates:
+            results.append({
+                "Case #": in_case,
+                "Input County": in_county,
+                "Output County": "",
+                "Case # Status": "New Case",
+                "County Status": "New Case",
+                "Source Input File": in_row.get("_source_file", ""),
+                "Notes": "",
+            })
+            continue
+
+        # Same Case # can exist under more than one County in the Output -
+        # match to the row whose County agrees with this Input row's County
+        # first; only fall back to the first row if none matches.
+        out_row = None
+        for cand in out_candidates:
+            cand_county = cand.get(out_county_col, "") if out_county_col else ""
+            if normalize_value_for_compare(cand_county).upper() == normalize_value_for_compare(in_county).upper():
+                out_row = cand
+                break
+        if out_row is None:
+            out_row = out_candidates[0]
+
+        out_county = out_row.get(out_county_col, "") if out_county_col else ""
+        county_status = (
+            "Match"
+            if normalize_value_for_compare(in_county) == normalize_value_for_compare(out_county)
+            else "Mismatch"
+        )
+
+        notes = ""
+        if len(out_candidates) > 1:
+            other_counties = sorted({
+                normalize_value_for_compare(c.get(out_county_col, "")) for c in out_candidates
+            } - {normalize_value_for_compare(out_county)})
+            if other_counties:
+                notes = (f"Case # also exists in Output under other County/Counties: "
+                         f"{', '.join(other_counties)}")
+
+        results.append({
+            "Case #": in_case,
+            "Input County": in_county,
+            "Output County": out_county,
+            "Case # Status": "Match",
+            "County Status": county_status,
+            "Source Input File": in_row.get("_source_file", ""),
+            "Notes": notes,
+        })
+
+    columns = ["Case #", "Input County", "Output County", "Case # Status",
+               "County Status", "Source Input File", "Notes"]
+    result_df = pd.DataFrame(results)
+    if result_df.empty:
+        result_df = pd.DataFrame(columns=columns)
+    else:
+        result_df = result_df[columns]
+    return result_df, not_found_count
+
+GREEN_FILL = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+
+RED_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+
+VAL_HEADER_FILL = PatternFill(start_color="305496", end_color="305496", fill_type="solid")
+
+VAL_HEADER_FONT = Font(color="FFFFFF", bold=True)
+
+def _write_df_to_sheet(ws, df, match_col_predicate=None):
+    """
+    match_col_predicate: optional function(col_name) -> bool, marking which
+    columns should be color-coded Match(green)/Mismatch(red).
+    """
+    if df.empty:
+        ws.append(["No records to display."])
+        return
+
+    ws.append(list(df.columns))
+    for cell in ws[1]:
+        cell.fill = VAL_HEADER_FILL
+        cell.font = VAL_HEADER_FONT
+        cell.alignment = Alignment(horizontal="center")
+
+    if match_col_predicate:
+        status_col_idx = [i for i, c in enumerate(df.columns) if match_col_predicate(c)]
+    else:
+        status_col_idx = []
+
+    for _, row in df.iterrows():
+        ws.append(list(row))
+        r = ws.max_row
+        for idx in status_col_idx:
+            cell = ws.cell(row=r, column=idx + 1)
+            val = str(cell.value or "")
+            if val == "Match":
+                cell.fill = GREEN_FILL
+            elif val.startswith("Mismatch") or val == "Not Found in Output" or "Not Found" in val or val == "New Case":
+                cell.fill = RED_FILL
+
+    for i, col in enumerate(df.columns, start=1):
+        max_len = max([len(str(col))] + [len(str(v)) for v in df[col].astype(str).tolist()])
+        ws.column_dimensions[get_column_letter(i)].width = min(max(10, max_len + 2), 40)
+
+    ws.freeze_panes = "A2"
+
+def build_validation_result_df(result_rows):
+    """Build the final DataFrame with columns in the exact required order.
+    Rows where every single Tool_Input AND Output value is blank (nothing
+    extracted from HTML and nothing in the Output Excel) are dropped -
+    they carry no information."""
+    columns = []
+    for field in FIELD_ORDER:
+        columns += [f"{field} (Tool_Input)", f"{field} (Output)", f"{field} Match"]
+    columns += ["Row Status"]
+
+    df = pd.DataFrame(result_rows)
+    for col in columns:
+        if col not in df.columns:
+            df[col] = ""
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+
+    value_cols = [f"{field} (Tool_Input)" for field in FIELD_ORDER] + [f"{field} (Output)" for field in FIELD_ORDER]
+    non_empty_mask = df[value_cols].apply(lambda col: col.astype(str).str.strip() != "").any(axis=1)
+    df = df[non_empty_mask]
+
+    return df[columns]
+
+def write_results(result_rows, case_summary, input_output_df, case_county_check_df,
+                   result_dir, output_name_tag="Output"):
+    os.makedirs(result_dir, exist_ok=True)
+    out_path = os.path.join(result_dir, f"{output_name_tag}_Validation_Results.xlsx")
+
+    validation_df = build_validation_result_df(result_rows)
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    ws1 = wb.create_sheet("Validation_Result")
+    _write_df_to_sheet(ws1, validation_df, match_col_predicate=lambda c: c.endswith("Match") or c == "Row Status")
+
+    ws2 = wb.create_sheet("Case#_Diff_County_Check")
+    _write_df_to_sheet(ws2, case_county_check_df)
+    # "Status" isn't a plain Match/Mismatch column like the others (it can
+    # read "OK" or a flag sentence), so re-color it here instead of relying
+    # on _write_df_to_sheet's Match/Mismatch coloring.
+    if not case_county_check_df.empty and "Status" in case_county_check_df.columns:
+        status_idx = list(case_county_check_df.columns).index("Status") + 1
+        flag_fill = PatternFill(start_color="FEF3CD", end_color="FEF3CD", fill_type="solid")
+        for r in range(2, ws2.max_row + 1):
+            cell = ws2.cell(row=r, column=status_idx)
+            if str(cell.value or "").strip() not in ("OK", ""):
+                cell.fill = flag_fill
+            else:
+                cell.fill = GREEN_FILL
+
+    ws3 = wb.create_sheet("Input_vs_Output")
+    _write_df_to_sheet(ws3, input_output_df, match_col_predicate=lambda c: c in ("Case # Status", "County Status"))
+
+    wb.save(out_path)
+    log.info("Results written to %s", out_path)
+    return out_path
+
+def run_validation(offline_dir, output_dir, input_dir, result_base_dir):
+    """Run the full validation pipeline against the given folders and return
+    a summary dict. Raises on unrecoverable errors (caller should catch)."""
+    log.info("=== GA Probate Validation Tool starting ===")
+
+    html_cases = load_all_html_cases(offline_dir)
+    output_df = load_excel_folder(output_dir)
+    input_df = load_excel_folder(input_dir)
+
+    result_rows, case_summary = build_validation_rows(html_cases, output_df)
+    input_output_df, not_found_cases = run_input_vs_output_validation(input_df, output_df)
+    case_county_check_df = build_case_county_check(html_cases, output_df)
+
+    same_case_diff_county_count = 0
+    if not case_county_check_df.empty:
+        same_case_diff_county_count = int((case_county_check_df["Status"] != "OK").sum())
+        if same_case_diff_county_count:
+            log.warning(
+                "%d Case #(s) flagged in Case#_Diff_County_Check (same Case # under "
+                "different County / HTML vs Output County mismatch) - please review.",
+                same_case_diff_county_count,
+            )
+
+    today_str = datetime.now().strftime("%d%m%Y")
+    result_dir = os.path.join(result_base_dir, f"Result_{today_str}")
+
+    output_name_tag = get_output_excel_name_tag(output_dir)
+    out_path = write_results(result_rows, case_summary, input_output_df, case_county_check_df,
+                              result_dir, output_name_tag)
+
+    total_cases = len(case_summary)
+    matched_cases = sum(1 for c in case_summary if c["Overall Status"] == "Match")
+    mismatched_cases = sum(1 for c in case_summary if c["Overall Status"] == "Mismatch")
+
+    # "New Case" = read straight from the Input_vs_Output sheet's "Case # Status"
+    # column (an Input Excel case whose Case # doesn't exist anywhere in Output yet).
+    if not input_output_df.empty and "Case # Status" in input_output_df.columns:
+        new_case_count = int((input_output_df["Case # Status"] == "New Case").sum())
+    else:
+        new_case_count = 0
+
+    # "Not Found" = "No records to display." placeholder rows in the Input
+    # Excel (counties the source site returned zero cases for) - counted by
+    # run_input_vs_output_validation, not part of input_output_df itself.
+
+    log.info(
+        "Done. %d case(s) processed, %d fully matched, %d mismatched, %d new case(s), %d not found (Input_vs_Output).",
+        total_cases, matched_cases, mismatched_cases, new_case_count, not_found_cases,
+    )
+    log.info("Open the results file: %s", out_path)
+
+    return {
+        "out_path": out_path,
+        "result_dir": result_dir,
+        "total_cases": total_cases,
+        "matched_cases": matched_cases,
+        "mismatched_cases": mismatched_cases,
+        "new_case_count": new_case_count,
+        "not_found_cases": not_found_cases,
+        "same_case_diff_county_count": same_case_diff_county_count,
+    }
+
+try:
+    from selenium import webdriver
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.keys import Keys
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.common.exceptions import (
+        TimeoutException, NoSuchElementException, StaleElementReferenceException
+    )
+    SELENIUM_AVAILABLE = True
+except ImportError:
+    SELENIUM_AVAILABLE = False
+
+BS4_AVAILABLE = True
+
+from openpyxl import Workbook
+
 SEARCH_URL = "https://georgiaprobaterecords.com/Traffic/SearchCitations.aspx"
+
+INPUT_FOLDER       = os.path.join(DATA_DIR, "CitationSearch", "Input")        # holds the County/Date Excel or .txt
+OUTPUT_FOLDER      = os.path.join(DATA_DIR, "CitationSearch", "Output")       # combined scrape-results workbook (result_MMDDYYYY.xlsx)
+OFFLINE_FOLDER     = os.path.join(DATA_DIR, "CitationSearch", "Offline")      # debug_<county>.html dumps
+TOOL_INPUT_FOLDER  = os.path.join(DATA_DIR, "CitationSearch", "Tool_Input")   # existing case list + Result workbook
 
 MATCH_STATUS_FILE_PREFIX = "CaseNumber_MatchStatus_"
 
 DEBUG_HTML_BASE_HREF = "https://georgiaprobaterecords.com/Traffic/"
-PAGE_LOAD_TIMEOUT = 25
-ELEMENT_TIMEOUT = 20
 
+PAGE_LOAD_TIMEOUT = 25
+
+ELEMENT_TIMEOUT = 20
 
 def ensure_folder(path):
     os.makedirs(path, exist_ok=True)
     return path
 
-
-# ─────────────────────────────────────────────────────────────────────────
-# DUPLICATE / LIKELY-MISSING CASE NUMBER DETECTION  (from Fixed_02)
-#
-# A duplicate found in the DATA is a signal that some OTHER case number is
-# probably missing (the site's RadGrid can occasionally render a stale
-# re-render that duplicates one row and silently drops a different,
-# adjacent one).
-#
-# Case numbers on this site follow a PREFIX + zero-padded NUMBER pattern
-# (e.g. "26T0313", "26T0314", ...). When duplicates are found, this helper
-# looks at the run of numbers sharing each prefix and reports any gaps in
-# that numeric sequence -- the most likely candidates for the case
-# number(s) that got silently dropped.
-# ─────────────────────────────────────────────────────────────────────────
 _CASE_NO_SPLIT_RE = re.compile(r"^([A-Za-z0-9]*?)(\d+)$")
-
 
 def _split_case_no(case_no):
     """Splits e.g. '26T0313' -> ('26T', '0313', 313). Returns None if the
@@ -176,7 +1006,6 @@ def _split_case_no(case_no):
         return None
     prefix, digits = m.group(1), m.group(2)
     return prefix, digits, int(digits)
-
 
 def find_duplicate_case_numbers(case_numbers):
     """Given a list of case-number strings (in the order encountered),
@@ -196,7 +1025,6 @@ def find_duplicate_case_numbers(case_numbers):
         else:
             seen_at[cn] = i
     return sorted(dupes), seen_at
-
 
 def infer_likely_missing_case_numbers(case_numbers):
     """Best-effort guess at which case number(s) were silently dropped when
@@ -232,10 +1060,6 @@ def infer_likely_missing_case_numbers(case_numbers):
             missing[prefix] = [f"{prefix}{str(n).zfill(width)}" for n in gap]
     return missing
 
-
-# ─────────────────────────────────────────────────────────────────────────
-# INPUT EXCEL loading  (County | Starting Date | Ending Date)
-# ─────────────────────────────────────────────────────────────────────────
 def find_latest_excel(folder, label=""):
     if not os.path.isdir(folder):
         raise FileNotFoundError(f"{label or 'Folder'} not found: {folder}")
@@ -247,23 +1071,15 @@ def find_latest_excel(folder, label=""):
         raise FileNotFoundError(f"No Excel file found in {label or folder}: {folder}")
     return max(candidates, key=os.path.getmtime)
 
-
-# Filenames that are OUTPUTS this same tool writes (combined results,
-# match-status/validation workbooks, the seeded baseline case-number
-# list). These must never be auto-picked as the County/Date INPUT file,
-# even if they land in the same folder and happen to be the newest file
-# there (e.g. Output/Tool Input folder pointed at the Input folder).
 _NON_INPUT_NAME_PREFIXES = (
     "result_",
     MATCH_STATUS_FILE_PREFIX.lower(),
     "lnga_casenumber_baseline",
 )
 
-
 def _looks_like_output_file(fname):
     lower = fname.lower()
     return any(lower.startswith(p) for p in _NON_INPUT_NAME_PREFIXES)
-
 
 def _file_has_input_headers(path):
     """Peeks the header row only (cheap) and reports whether it contains
@@ -280,7 +1096,6 @@ def _file_has_input_headers(path):
             return any("county" in c for c in cols)
     except Exception:
         return False
-
 
 def find_latest_input_file(folder, label=""):
     """Same as find_latest_excel but also considers .txt input files (the
@@ -323,7 +1138,6 @@ def find_latest_input_file(folder, label=""):
         f"has a 'County' column in its header row — nothing looks like a valid "
         f"input file. Use Browse to pick the correct one.")
 
-
 def _normalize_date_cell(value):
     """County/date Excel cells may come back from Excel as real datetimes
     (if the user formatted the column as a date) or as plain DD-MM-YYYY
@@ -340,7 +1154,6 @@ def _normalize_date_cell(value):
     if m:
         return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
     return text
-
 
 def load_input_excel(path):
     """Reads County / Starting Date / Ending Date from an Excel file.
@@ -386,7 +1199,6 @@ def load_input_excel(path):
         })
     return rows
 
-
 def load_input_txt(path):
     """Reads County / Starting Date / Ending Date from the original
     tab-separated .txt format (County\tStarting Date\tEnding Date), exactly
@@ -407,7 +1219,6 @@ def load_input_txt(path):
                 rows.append({"county": county, "start_date": start_date, "end_date": end_date})
     return rows
 
-
 def load_input_file(path):
     """Dispatches to the .txt or .xlsx loader based on the file's
     extension, so the GUI's Input File field accepts either the original
@@ -421,19 +1232,12 @@ def load_input_file(path):
         f"Unsupported input file type '{ext}'. Use a .txt (tab-separated: "
         f"County / Starting Date / Ending Date) or .xlsx (same columns) file.")
 
-
 def to_date_input_format(ddmmyyyy_str):
     """Convert 'DD-MM-YYYY' to the site's own display format, M/D/YYYY with
     NO leading zeros (e.g. '6/20/2026')."""
     dt = datetime.strptime(ddmmyyyy_str.strip(), "%d-%m-%Y")
     return f"{dt.month}/{dt.day}/{dt.year}"
 
-
-# ─────────────────────────────────────────────────────────────────────────
-# Debug-HTML helper (patches saved debug_<county>.html so it can be opened
-# later in a browser for troubleshooting, with CSS/JS/images resolving
-# back against the live site)
-# ─────────────────────────────────────────────────────────────────────────
 def patch_debug_html_for_offline_viewing(html, base_href=DEBUG_HTML_BASE_HREF):
     """Inserts <base href="..."> so a saved debug_<county>.html opened later
     resolves its CSS/JS/images back against the live site."""
@@ -442,19 +1246,20 @@ def patch_debug_html_for_offline_viewing(html, base_href=DEBUG_HTML_BASE_HREF):
         return re.sub(r"(<head[^>]*>)", r"\1" + base_tag, html, count=1, flags=re.IGNORECASE)
     return base_tag + html
 
-
-# ─────────────────────────────────────────────────────────────────────────
-# Selenium driver + search-form interaction  (unchanged behavior — verified
-# against the live search page; see the original script's history)
-# ─────────────────────────────────────────────────────────────────────────
 ID_COUNTY_DROPDOWN   = "ctl00_cpMain_ddlCounty"
+
 ID_COUNTY_POPUP      = "ctl00_cpMain_ddlCounty_DropDown"
+
 ID_OFFENSE_START     = "ctl00_cpMain_txtViolationStartDate_dateInput"
+
 ID_OFFENSE_END       = "ctl00_cpMain_txtViolationEndDate_dateInput"
+
 ID_SEARCH_BUTTON     = "ctl00_cpMain_rbSearch_input"
+
 ID_RESULTS_GRID_CONTAINER = "ctl00_cpMain_rapGrid"
 
 RESULT_COLUMNS = ["CASE #", "OFFENDER", "OFFENSE DATE", "COURT DATE", "DISPOSED", "COUNTY"]
+
 _HEADER_KEY_MAP = {
     "CASE #":       "case_number",
     "OFFENDER":     "offender",
@@ -464,37 +1269,36 @@ _HEADER_KEY_MAP = {
     "COUNTY":       "county",
 }
 
-
 def build_driver(headless=True):
+    """Build a Chrome webdriver. On Render (or any Docker container) this
+    reads CHROME_BIN / CHROMEDRIVER_PATH env vars, set in the Dockerfile,
+    so it points at the container's installed Chromium + matching driver
+    instead of relying on a machine-local Chrome install. Locally (no
+    env vars set) it falls back to Selenium Manager auto-detection,
+    same as the original desktop tool."""
     options = webdriver.ChromeOptions()
     if headless:
         options.add_argument("--headless=new")
     options.add_argument("--window-size=1440,1000")
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-dev-shm-usage")  # container /dev/shm is tiny by default
     options.add_argument("--log-level=3")
 
-    # In the container, CHROME_BIN / CHROMEDRIVER_PATH point at the
-    # Chromium + chromedriver baked into the Docker image (see Dockerfile),
-    # so Selenium doesn't try to auto-download a browser at request time.
-    # Locally (no env vars set) this falls back to selenium-manager's
-    # normal auto-detect behavior, unchanged from the original script.
     chrome_bin = os.environ.get("CHROME_BIN")
     if chrome_bin:
         options.binary_location = chrome_bin
 
-    driver_path = os.environ.get("CHROMEDRIVER_PATH")
-    if driver_path:
+    chromedriver_path = os.environ.get("CHROMEDRIVER_PATH")
+    if chromedriver_path:
         from selenium.webdriver.chrome.service import Service
-        service = Service(executable_path=driver_path)
-        driver = webdriver.Chrome(options=options, service=service)
+        service = Service(executable_path=chromedriver_path)
+        driver = webdriver.Chrome(service=service, options=options)
     else:
         driver = webdriver.Chrome(options=options)
 
     driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
     return driver
-
 
 def select_county(driver, county_name, match_timeout=6):
     wait = WebDriverWait(driver, ELEMENT_TIMEOUT)
@@ -527,7 +1331,6 @@ def select_county(driver, county_name, match_timeout=6):
         pass
     wait_for_ajax_idle(driver)
 
-
 def _set_date_via_telerik_api(driver, picker_client_id, date_str):
     script = """
         var clientId = arguments[0];
@@ -548,7 +1351,6 @@ def _set_date_via_telerik_api(driver, picker_client_id, date_str):
         return driver.execute_script(script, picker_client_id, date_str)
     except Exception as e:
         return {"sys_defined": None, "picker_found": False, "set_succeeded": False, "js_error": str(e)}
-
 
 def _type_into_date_input(driver, input_el, date_str, picker_client_id=None, field_label=""):
     driver.execute_script("arguments[0].value = '';", input_el)
@@ -602,7 +1404,6 @@ def _type_into_date_input(driver, input_el, date_str, picker_client_id=None, fie
         f"the Telerik API call, and the raw-value fallback. Final input value seen: "
         f"'{final_val}'. Telerik API diagnostics: {diagnostics}.")
 
-
 def wait_for_ajax_idle(driver, timeout=8):
     try:
         WebDriverWait(driver, timeout).until(
@@ -615,11 +1416,9 @@ def wait_for_ajax_idle(driver, timeout=8):
     except TimeoutException:
         pass
 
-
 def _find_fresh(driver, element_id, timeout=ELEMENT_TIMEOUT):
     return WebDriverWait(driver, timeout).until(
         EC.presence_of_element_located((By.ID, element_id)))
-
 
 def set_offense_date_range(driver, start_ddmmyyyy, end_ddmmyyyy):
     start_str = to_date_input_format(start_ddmmyyyy)
@@ -637,7 +1436,6 @@ def set_offense_date_range(driver, start_ddmmyyyy, end_ddmmyyyy):
     _type_into_date_input(driver, end_input, end_str, picker_client_id=end_picker_id,
                            field_label="Offense Date End")
     wait_for_ajax_idle(driver)
-
 
 def click_search(driver):
     wait = WebDriverWait(driver, ELEMENT_TIMEOUT)
@@ -663,7 +1461,6 @@ def click_search(driver):
         except TimeoutException:
             continue
     raise RuntimeError("Could not locate the Search button (tried several selectors).")
-
 
 def set_page_size(driver, grid_container_id=ID_RESULTS_GRID_CONTAINER, target_size=30, timeout=8):
     """Forces the results grid's page-size combo box (Telerik RadComboBox,
@@ -760,18 +1557,9 @@ def set_page_size(driver, grid_container_id=ID_RESULTS_GRID_CONTAINER, target_si
 
     return False
 
-
 _PAGER_TEXT_RE = re.compile(r"page\s*size", re.IGNORECASE)
 
-# Matches the RadGrid pager's own summary text, e.g. "96 items in 4 pages",
-# rendered in a <div class="rgInfoPart"> inside the same pager row that
-# _is_pager_row() excludes. Used purely as a self-check AFTER paging is
-# complete — comparing the number of rows actually collected against the
-# total the grid itself reports, so a silently-truncated scrape (e.g. the
-# Next-click loop stopping early because of a slow AJAX postback) shows up
-# as a logged warning instead of quietly shipping a partial result set.
 _GRID_TOTAL_RE = re.compile(r"(\d+)\s+items?\s+in\s+(\d+)\s+pages?", re.IGNORECASE)
-
 
 def _get_grid_expected_total(driver, grid_container_id=ID_RESULTS_GRID_CONTAINER):
     """Reads the RadGrid's 'N items in M pages' summary (rgInfoPart) and
@@ -788,7 +1576,6 @@ def _get_grid_expected_total(driver, grid_container_id=ID_RESULTS_GRID_CONTAINER
     except Exception:
         pass
     return None, None
-
 
 def _is_pager_row(tr):
     """Identify the RadGrid pager row — the row that renders the page-number
@@ -820,7 +1607,6 @@ def _is_pager_row(tr):
     except Exception:
         pass
     return False
-
 
 def _click_next_numeric_page(search_root, driver, current_page_num):
     """Fallback pager strategy for grids whose pager renders as PURE page
@@ -857,7 +1643,6 @@ def _click_next_numeric_page(search_root, driver, current_page_num):
     except Exception:
         pass
     return False
-
 
 def _wait_grid_row_count_stable(driver, grid_container_id=ID_RESULTS_GRID_CONTAINER,
                                  timeout=6, stable_polls=2, poll_interval=0.3):
@@ -908,7 +1693,6 @@ def _wait_grid_row_count_stable(driver, grid_container_id=ID_RESULTS_GRID_CONTAI
             stable_hits = 0
         last_count = count
         time.sleep(poll_interval)
-
 
 def scrape_result_rows(driver, timeout=ELEMENT_TIMEOUT, max_pages=200, log=None):
     if log is None:
@@ -1021,7 +1805,10 @@ def scrape_result_rows(driver, timeout=ELEMENT_TIMEOUT, max_pages=200, log=None)
                     if len(values) == 1 and _PAGER_TEXT_RE.search(values[0]):
                         continue
                     values = (values + [""] * len(header_keys))[:len(header_keys)]
+                    values = [strip_junk_chars(v) for v in values]
                     row_dict = dict(zip(header_keys, values))
+                    if "offender" in row_dict:
+                        row_dict["offender"] = clean_name_value(row_dict["offender"])
                     if row_dict.get("case_number") and not _PAGER_TEXT_RE.search(row_dict["case_number"]):
                         page_rows.append(row_dict)
 
@@ -1271,7 +2058,6 @@ def scrape_result_rows(driver, timeout=ELEMENT_TIMEOUT, max_pages=200, log=None)
 
     return deduped_results
 
-
 def _html_is_pager_row(tr):
     cls = " ".join(tr.get("class", []) or []).lower()
     if "pager" in cls:
@@ -1288,14 +2074,13 @@ def _html_is_pager_row(tr):
             return True
     return False
 
-
 def _parse_offline_page(path, grid_container_id=ID_RESULTS_GRID_CONTAINER):
     """Parses one saved HTML page and returns (case_numbers, expected_total,
     expected_pages). expected_total/pages come from that page's own
     'N items in M pages' rgInfoPart summary, or (None, None) if absent."""
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         html = f.read()
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
     container = soup.find(id=grid_container_id)
     search_root = container if container else soup
 
@@ -1340,6 +2125,86 @@ def _parse_offline_page(path, grid_container_id=ID_RESULTS_GRID_CONTAINER):
             case_numbers.append(case_no)
     return case_numbers, expected_total, expected_pages
 
+_OFFLINE_LIST_NAME_RE = re.compile(
+    r"^(?P<county>[A-Za-z]+)_"
+    r"\d{1,2}-\d{1,2}-\d{4}_\d{1,2}-\d{1,2}-\d{4}_"
+    r"List_(?P<num>\d{1,3})$",
+    re.IGNORECASE,
+)
+
+_OFFLINE_LIST_ALREADY_DONE_RE = re.compile(
+    r"^(?P<county>[A-Za-z]+)_LIST_(?P<num>\d{1,3})$",
+    re.IGNORECASE,
+)
+
+def build_offline_list_name(filepath):
+    """Given an offline list filepath (or bare filename), return the new
+    '<COUNTY>_LIST_<N>.html' name, or None if it doesn't match the
+    '<COUNTY>_<start>_<end>_List_<N>' pattern, or N is outside 1-100."""
+    base = os.path.basename(filepath)
+    stem, ext = os.path.splitext(base)
+    m = _OFFLINE_LIST_NAME_RE.match(stem)
+    if not m:
+        return None
+    num = int(m.group("num"))
+    if not (1 <= num <= 100):
+        return None
+    county = m.group("county").upper()
+    return f"{county}_LIST_{num}{ext.lower()}"
+
+def is_already_offline_list_name(filepath):
+    """True if filepath is already in the short '<COUNTY>_LIST_<N>' form
+    (no date data tacked on) -- nothing to rename."""
+    stem = os.path.splitext(os.path.basename(filepath))[0]
+    m = _OFFLINE_LIST_ALREADY_DONE_RE.match(stem)
+    if not m:
+        return False
+    return 1 <= int(m.group("num")) <= 100
+
+def is_offline_list_filename(filepath):
+    """True if filepath is a search-results LIST page (e.g.
+    'BUTTS_6-9-2026_6-15-2026_List_3.html' or the already-renamed
+    'BUTTS_LIST_3.html') rather than a single-case offline file
+    ('<COUNTY>_<CASE#>.html'). These LIST pages hold a whole page of
+    citation rows, not one case's fields, so they must NOT be fed into
+    the single-case extractor -- doing so misreads the date/number
+    portion of the filename as a Case #, which is what was causing the
+    spurious 'Mismatch (Case #, County)' Row Status entries."""
+    stem = os.path.splitext(os.path.basename(filepath))[0]
+    return bool(_OFFLINE_LIST_NAME_RE.match(stem) or _OFFLINE_LIST_ALREADY_DONE_RE.match(stem))
+
+def rename_offline_list_files(folder, dry_run=False):
+    """Renames every offline list HTML file in `folder` from
+    '<COUNTY>_<start>-<end>_List_<N>.html' to '<COUNTY>_LIST_<N>.html'.
+    Files already in the '<COUNTY>_LIST_<N>.html' form are left alone
+    and are NOT reported as skipped/unmatched.
+    Returns a list of (old_name, new_name) pairs that were (or would be)
+    renamed, and a list of (name, reason) for files that genuinely don't
+    match either recognized pattern."""
+    renamed, skipped = [], []
+    files = sorted(
+        glob.glob(os.path.join(folder, "*.html")) + glob.glob(os.path.join(folder, "*.htm"))
+    )
+    for fp in files:
+        old_name = os.path.basename(fp)
+
+        if is_already_offline_list_name(fp):
+            continue  # already correctly named -- nothing to do
+
+        new_name = build_offline_list_name(fp)
+        if new_name is None:
+            skipped.append((old_name, "does not match '<COUNTY>_<start>_<end>_List_<N>' pattern"))
+            continue
+        if new_name == old_name:
+            continue
+        new_path = os.path.join(folder, new_name)
+        if os.path.exists(new_path):
+            skipped.append((old_name, f"target '{new_name}' already exists"))
+            continue
+        if not dry_run:
+            os.rename(fp, new_path)
+        renamed.append((old_name, new_name))
+    return renamed, skipped
 
 def verify_offline_html_pages(paths):
     """Runs the offline pagination check across one or more saved HTML
@@ -1352,7 +2217,7 @@ def verify_offline_html_pages(paths):
     """
     if not BS4_AVAILABLE:
         return False, ("BeautifulSoup is required for this check.\n"
-                        "Install it with:  pip install beautifulsoup4")
+                        "Install it with:  pip install beautifulsoup4 lxml")
     if not paths:
         return False, "No HTML file(s) selected."
 
@@ -1421,17 +2286,20 @@ def verify_offline_html_pages(paths):
     lines.append("RESULT: PASS" if ok else "RESULT: FAIL")
     return ok, "\n".join(lines)
 
+HEADER_FONT  = Font(bold=True, color="FFFFFF", name="Arial", size=10)
 
-# ─────────────────────────────────────────────────────────────────────────
-# Excel styling
-# ─────────────────────────────────────────────────────────────────────────
-CS_HEADER_FONT  = Font(bold=True, color="FFFFFF", name="Arial", size=10)
-CS_HEADER_FILL  = PatternFill("solid", fgColor="1F4E79")
+HEADER_FILL  = PatternFill("solid", fgColor="1F4E79")
+
 CELL_FONT    = Font(name="Arial", size=10)
+
 CENTER_ALIGN = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
 THIN         = Side(style="thin", color="D9D9D9")
+
 CELL_BORDER  = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+
 NORMAL_FILL  = PatternFill("solid", fgColor="FFFFFF")
+
 ALT_FILL     = PatternFill("solid", fgColor="F2F6FA")
 
 STATUS_FONT = {
@@ -1439,12 +2307,12 @@ STATUS_FONT = {
     "New (scraped only)":      Font(name="Arial", size=10, bold=True, color="9C5700"),
     "Missing (existing only)": Font(name="Arial", size=10, bold=True, color="C00000"),
 }
+
 STATUS_FILL = {
     "Match":                   PatternFill("solid", fgColor="E2F0D9"),
     "New (scraped only)":      PatternFill("solid", fgColor="FFF2CC"),
     "Missing (existing only)": PatternFill("solid", fgColor="FCE4E4"),
 }
-
 
 def build_output_path(output_folder, tag=""):
     """Saves a flat file directly in output_folder (e.g.
@@ -1455,13 +2323,11 @@ def build_output_path(output_folder, tag=""):
     suffix = f"_{tag}" if tag else ""
     return os.path.join(output_folder, f"result_{stamp}{suffix}.xlsx")
 
-
 def build_match_status_path(tool_input_folder, tag=""):
     ensure_folder(tool_input_folder)
     stamp = datetime.now().strftime("%m%d%Y")
     suffix = f"_{tag}" if tag else ""
     return os.path.join(tool_input_folder, f"{MATCH_STATUS_FILE_PREFIX}{stamp}{suffix}.xlsx")
-
 
 def write_combined_workbook(county_results, output_path):
     wb = openpyxl.Workbook()
@@ -1472,7 +2338,7 @@ def write_combined_workbook(county_results, output_path):
     row_keys = ["case_number", "offender", "offense_date", "court_date", "disposed", "county"]
     for ci, h in enumerate(headers, 1):
         c = ws.cell(row=1, column=ci, value=h)
-        c.font, c.fill, c.alignment, c.border = CS_HEADER_FONT, CS_HEADER_FILL, CENTER_ALIGN, CELL_BORDER
+        c.font, c.fill, c.alignment, c.border = HEADER_FONT, HEADER_FILL, CENTER_ALIGN, CELL_BORDER
     ws.freeze_panes = "A2"
 
     row_idx = 2
@@ -1500,7 +2366,7 @@ def write_combined_workbook(county_results, output_path):
     summary_headers = ["County", "Starting Date", "Ending Date", "Status", "Rows Found"]
     for ci, h in enumerate(summary_headers, 1):
         c = ws2.cell(row=1, column=ci, value=h)
-        c.font, c.fill, c.alignment, c.border = CS_HEADER_FONT, CS_HEADER_FILL, CENTER_ALIGN, CELL_BORDER
+        c.font, c.fill, c.alignment, c.border = HEADER_FONT, HEADER_FILL, CENTER_ALIGN, CELL_BORDER
     for ri, r in enumerate(county_results, 2):
         values = [r["county"], r["start_date"], r["end_date"], r["status"], len(r["rows"])]
         for ci, v in enumerate(values, 1):
@@ -1511,7 +2377,6 @@ def write_combined_workbook(county_results, output_path):
 
     wb.save(output_path)
     return output_path
-
 
 def find_compare_file(tool_input_folder, explicit_path=None, log=print):
     if explicit_path:
@@ -1539,7 +2404,6 @@ def find_compare_file(tool_input_folder, explicit_path=None, log=print):
             f"{os.path.basename(candidates[0])}")
     return candidates[0]
 
-
 def read_existing_case_numbers(path):
     wb = openpyxl.load_workbook(path, data_only=True)
     ws = wb.active
@@ -1563,7 +2427,6 @@ def read_existing_case_numbers(path):
             numbers.add(str(row[case_col_idx]).strip())
     return numbers
 
-
 def write_match_status_workbook(existing_numbers, scraped_numbers, compare_file_path, output_path):
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -1572,7 +2435,7 @@ def write_match_status_workbook(existing_numbers, scraped_numbers, compare_file_
     headers = ["Case #", "Status"]
     for ci, h in enumerate(headers, 1):
         c = ws.cell(row=1, column=ci, value=h)
-        c.font, c.fill, c.alignment, c.border = CS_HEADER_FONT, CS_HEADER_FILL, CENTER_ALIGN, CELL_BORDER
+        c.font, c.fill, c.alignment, c.border = HEADER_FONT, HEADER_FILL, CENTER_ALIGN, CELL_BORDER
     ws.freeze_panes = "A2"
 
     all_numbers = sorted(existing_numbers | scraped_numbers)
@@ -1629,10 +2492,6 @@ def write_match_status_workbook(existing_numbers, scraped_numbers, compare_file_
 
     return output_path, match_count, new_count, missing_count, report_df
 
-
-# ─────────────────────────────────────────────────────────────────────────
-# LIVE SEARCH pipeline (Selenium, drives the real site)
-# ─────────────────────────────────────────────────────────────────────────
 def run_live_pipeline(cfg, log, on_done):
     """cfg keys: input_file, output_folder, offline_folder, tool_input_folder,
     delay_seconds_minimum, delay_seconds_maximum, headless, limit"""
@@ -1641,6 +2500,14 @@ def run_live_pipeline(cfg, log, on_done):
             raise RuntimeError(
                 "selenium is not installed. Install it with:  pip install selenium")
 
+        log("=" * 62)
+        log("  LNGA Probate Courts — Live Search")
+        log("=" * 62)
+        log(f"  Input Excel     : {cfg['input_file']}")
+        log(f"  Output folder   : {cfg['output_folder']}")
+        log(f"  Offline folder  : {cfg['offline_folder']}")
+        log(f"  Tool Input      : {cfg['tool_input_folder']}")
+
         county_rows = load_input_file(cfg["input_file"])
         limit = cfg.get("limit") or 0
         if limit:
@@ -1648,8 +2515,8 @@ def run_live_pipeline(cfg, log, on_done):
         if not county_rows:
             raise RuntimeError(f"No county rows parsed from: {cfg['input_file']}")
 
-        log(f"Starting Citation Search — {len(county_rows)} "
-            f"count{'y' if len(county_rows) == 1 else 'ies'} to process.")
+        log(f"  Counties to process : {len(county_rows)}")
+        log(f"  Browser mode        : {'headless' if cfg.get('headless', True) else 'visible'}\n")
 
         ensure_folder(cfg["offline_folder"])
         driver = build_driver(headless=cfg.get("headless", True))
@@ -1738,7 +2605,6 @@ def run_live_pipeline(cfg, log, on_done):
         log(f"\n[FATAL ERROR]\n{traceback.format_exc()}")
         on_done(False, None, None, {})
 
-
 def _finish_pipeline(county_results, cfg, log, on_done, tag):
     """Shared tail end for both pipelines: write the combined Output
     workbook, then the Match/New/Missing Result workbook against whatever
@@ -1808,624 +2674,85 @@ def _finish_pipeline(county_results, cfg, log, on_done, tag):
     on_done(True, output_path, match_path, stats)
 
 
-def normalize_key(value):
-    """Normalize a value for use as a join key (case #, county names etc)."""
-    if value is None:
-        return ""
-    s = str(value).strip()
-    if s.lower() in ("nan", "none", "nat"):
-        return ""
-    s = re.sub(r"\s+", " ", s).upper()
-    return s
+# ══════════════════════════════════════════════════════
+#  WEB-SERVICE ORCHESTRATION HELPERS
+#  Thin wrappers around the pipelines above, aimed at Flask routes /
+#  background threads instead of the original Tkinter windows.
+# ══════════════════════════════════════════════════════
 
+def run_citation_search_job(input_file_path, job_dir, log, headless=True, limit=None,
+                             compare_file=None, delay_min=0.0, delay_max=0.0, on_done=None):
+    """Run the Citation Search pipeline for a web request.
 
-def normalize_header(value):
-    """Normalize a column header for fuzzy matching (lowercase, strip punctuation/spaces)."""
-    s = str(value).strip().lower()
-    s = re.sub(r"[^a-z0-9]+", "", s)
-    return s
+    input_file_path : path to the uploaded County/Start/End .xlsx or .txt
+    job_dir          : a fresh per-job directory (e.g. DATA_DIR/jobs/<uuid>)
+                        under which Output/Offline/Tool_Input subfolders
+                        are created and the result workbooks are written
+    log              : callable(str) -> None, called with progress lines
+    compare_file     : optional path to an existing case-number workbook
+                        to diff the fresh scrape against (else a baseline
+                        is seeded from this run's own results)
+    on_done          : optional callable(success, output_path, match_path, stats)
 
-
-NO_RECORDS_MARKERS = (
-    "no records to display",
-    "no records found",
-    "no record found",
-    "no results found",
-    "no data to display",
-    "no matching records found",
-)
-
-
-def is_no_records_placeholder(value):
-    """True if value is one of the site's 'zero results for this county'
-    placeholder strings (e.g. 'No records to display.') rather than an
-    actual Case #. These show up as a single placeholder row per empty
-    county in the Input Excel and must NOT be treated as a real case
-    that is 'New'/'Not Found' in the Output."""
-    s = normalize_value_for_compare(value).lower().rstrip(".")
-    return s in NO_RECORDS_MARKERS
-
-
-def normalize_value_for_compare(value):
-    """Normalize a field value before comparing HTML vs Excel (trim, collapse spaces, blank-safe)."""
-    if value is None:
-        return ""
-    s = str(value).strip()
-    if s.lower() in ("nan", "none", "nat"):
-        return ""
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-
-def find_output_column(df_columns, field):
+    Returns the same (success, output_path, match_path, stats) tuple that
+    is passed to on_done, for callers that just want to await the result.
     """
-    Find the Output Excel column for a given field. Tries, in order:
-        1. exact "<field> (Output)"  (your standard header pattern)
-        2. "<field> (Output)" using each synonym from OUTPUT_COLUMN_CANDIDATES
-        3. bare synonym column names (no "(Output)" suffix), as a fallback
-    Returns the actual column name, or None if nothing matches.
-    """
-    norm_map = {normalize_header(c): c for c in df_columns}
-
-    exact_key = normalize_header(f"{field} (Output)")
-    if exact_key in norm_map:
-        return norm_map[exact_key]
-
-    for cand in OUTPUT_COLUMN_CANDIDATES.get(field, []):
-        key = normalize_header(f"{cand} (Output)")
-        if key in norm_map:
-            return norm_map[key]
-
-    for cand in OUTPUT_COLUMN_CANDIDATES.get(field, [field]):
-        key = normalize_header(cand)
-        if key in norm_map:
-            return norm_map[key]
-
-    return None
-
-
-def find_column(df_columns, candidates):
-    """Generic fuzzy header match (used for the Input Excel, which has no (Output) suffix)."""
-    norm_map = {normalize_header(c): c for c in df_columns}
-    for cand in candidates:
-        norm_cand = normalize_header(cand)
-        if norm_cand in norm_map:
-            return norm_map[norm_cand]
-    return None
-
-
-# ============================================================
-# STEP 1: EXTRACT DATA FROM OFFLINE HTML FILES
-# ============================================================
-
-def get_text_by_id_suffix(soup, suffix):
-    """Find the first element whose id ATTRIBUTE ENDS WITH suffix, return its text."""
-    pattern = re.compile(re.escape(suffix) + r"$")
-    el = soup.find(id=pattern)
-    if el is None:
-        return ""
-    return el.get_text(separator=" ", strip=True)
-
-
-COUNTY_SUFFIX_PATTERN = re.compile(r"\s*County\s+Probate\s+Court\s*$", re.IGNORECASE)
-
-
-def clean_county_value(value):
-    """Strip a trailing 'County Probate Court' from a County value, e.g.
-    'Fulton County Probate Court' -> 'Fulton'."""
-    if not value:
-        return value
-    return COUNTY_SUFFIX_PATTERN.sub("", value).strip()
-
-
-def extract_case_from_html(filepath):
-    """Parse one offline HTML case file and return a dict of extracted data."""
-    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-        html = f.read()
-    soup = BeautifulSoup(html, "html.parser")
-
-    case = {"_source_file": os.path.basename(filepath)}
-
-    for field, suffix in SINGLE_FIELD_SUFFIXES.items():
-        case[field] = get_text_by_id_suffix(soup, suffix)
-
-    # "Fulton County Probate Court" -> "Fulton"
-    case["County"] = clean_county_value(case.get("County", ""))
-
-    citations = []
-    for i in range(MAX_ROW_INDEX + 1):
-        row = {}
-        has_value = False
-        for field, prefix in ROW_FIELD_PREFIXES.items():
-            val = get_text_by_id_suffix(soup, f"{prefix}{i}")
-            row[field] = val
-            if val:
-                has_value = True
-        row["_index"] = i
-        if has_value:
-            citations.append(row)
-
-    case["Citations"] = citations
-    return case
-
-
-def load_all_html_cases(html_dir):
-    """Load and extract every .html/.htm file in html_dir."""
-    files = sorted(
-        glob.glob(os.path.join(html_dir, "*.html"))
-        + glob.glob(os.path.join(html_dir, "*.htm"))
-    )
-    if not files:
-        log.warning("No .html/.htm files found in %s", html_dir)
-    cases = []
-    for fp in files:
-        try:
-            cases.append(extract_case_from_html(fp))
-        except Exception as e:
-            log.error("Failed to parse %s: %s", fp, e)
-    log.info("Extracted %d case(s) from %d HTML file(s) in %s", len(cases), len(files), html_dir)
-    return cases
-
-
-# ============================================================
-# STEP 2: LOAD OUTPUT / INPUT EXCEL (all files, combined)
-# ============================================================
-
-def get_output_excel_name_tag(excel_dir):
-    """Build a filename tag from the Output Excel file name(s) in excel_dir,
-    e.g. 'Fulton_Output' -> 'Fulton_Output'. If multiple output excel files
-    exist, their names are joined with '_'. Falls back to 'Output' if none found."""
-    files = sorted(
-        glob.glob(os.path.join(excel_dir, "*.xlsx"))
-        + glob.glob(os.path.join(excel_dir, "*.xls"))
-    )
-    files = [f for f in files if not os.path.basename(f).startswith("~$")]
-    if not files:
-        return "Output"
-    names = [os.path.splitext(os.path.basename(f))[0] for f in files]
-    tag = "_".join(names)
-    tag = re.sub(r"[^A-Za-z0-9_\-]+", "_", tag).strip("_")
-    return tag or "Output"
-
-
-def load_excel_folder(excel_dir):
-    """Read every .xlsx/.xls file in excel_dir into one combined DataFrame (all sheets, all files).
-    Skips Excel's hidden lock/temp files (e.g. '~$Book1.xlsx'), which are created
-    while a workbook is open elsewhere and are not readable spreadsheets."""
-    files = sorted(
-        glob.glob(os.path.join(excel_dir, "*.xlsx"))
-        + glob.glob(os.path.join(excel_dir, "*.xls"))
-    )
-    files = [f for f in files if not os.path.basename(f).startswith("~$")]
-    if not files:
-        log.warning("No .xlsx/.xls files found in %s", excel_dir)
-        return pd.DataFrame()
-
-    frames = []
-    for fp in files:
-        try:
-            xls = pd.ExcelFile(fp)
-            for sheet in xls.sheet_names:
-                df = xls.parse(sheet, dtype=str)
-                df["_source_file"] = os.path.basename(fp)
-                df["_source_sheet"] = sheet
-                frames.append(df)
-        except Exception as e:
-            log.error("Failed to read %s: %s", fp, e)
-
-    if not frames:
-        return pd.DataFrame()
-
-    combined = pd.concat(frames, ignore_index=True, sort=False)
-    log.info("Loaded %d row(s) from %d excel file(s) in %s", len(combined), len(files), excel_dir)
-    return combined
-
-
-# ============================================================
-# STEP 3: FIELD-LEVEL VALIDATION -- HTML (Tool_Input) vs OUTPUT EXCEL
-# ============================================================
-
-def resolve_output_columns(output_df):
-    """Resolve the actual Output Excel column name for every field, once."""
-    resolved = {}
-    for field in FIELD_ORDER:
-        resolved[field] = find_output_column(output_df.columns, field)
-    return resolved
-
-
-def group_output_rows_by_case(output_df, case_col):
-    """Group Output Excel rows by normalized Case # (Output), preserving row order."""
-    groups = {}
-    for _, row in output_df.iterrows():
-        key = normalize_key(row.get(case_col, ""))
-        if not key:
-            continue
-        groups.setdefault(key, []).append(row)
-    return groups
-
-
-def pair_citations(html_citations, output_rows):
-    """
-    Pair each HTML citation with an Output Excel row (one row = one citation).
-    1) Exact match by normalized Citation Number where both sides have one.
-    2) Leftover citations/rows are paired by original order (position).
-    3) Any unmatched leftovers on either side are paired with None.
-    Returns a list of (html_citation_or_None, output_row_or_None) tuples.
-    """
-    html_remaining = list(html_citations)
-    output_remaining = list(output_rows)
-
-    # exact Citation Number match first
-    pairs = []
-    used_output_idx = set()
-    still_unmatched_html = []
-    for cit in html_remaining:
-        cit_no = normalize_key(cit.get("Citation Number", ""))
-        matched_idx = None
-        if cit_no:
-            for i, out_row in enumerate(output_remaining):
-                if i in used_output_idx:
-                    continue
-                out_cit_no = normalize_key(out_row.get("_Citation Number_resolved", ""))
-                if out_cit_no and out_cit_no == cit_no:
-                    matched_idx = i
-                    break
-        if matched_idx is not None:
-            pairs.append((cit, output_remaining[matched_idx]))
-            used_output_idx.add(matched_idx)
-        else:
-            still_unmatched_html.append(cit)
-
-    unused_output = [r for i, r in enumerate(output_remaining) if i not in used_output_idx]
-
-    # positional pairing for the rest
-    for i in range(max(len(still_unmatched_html), len(unused_output))):
-        h = still_unmatched_html[i] if i < len(still_unmatched_html) else None
-        o = unused_output[i] if i < len(unused_output) else None
-        pairs.append((h, o))
-
-    if not pairs:
-        # no citations on either side -- still emit one blank citation slot
-        pairs = [(None, None)]
-
-    return pairs
-
-
-def field_match_status(tool_val, output_val):
-    t = normalize_value_for_compare(tool_val)
-    o = normalize_value_for_compare(output_val)
-    if t == "" and o == "":
-        return "Match"  # nothing to compare -- treated as match
-    return "Match" if t.upper() == o.upper() else "Mismatch"
-
-
-def build_validation_rows(html_cases, output_df):
-    """
-    Build the main result rows: one row per (case, citation) pair, with
-    "<Field> (Tool_Input)", "<Field> (Output)", "<Field> Match" for every
-    field in FIELD_ORDER, plus "Row Status".
-    """
-    if output_df.empty:
-        log.warning("Output Excel is empty/missing - skipping field validation.")
-        return [], []
-
-    output_cols = resolve_output_columns(output_df)
-    case_col = output_cols.get("Case #")
-    if case_col is None:
-        raise ValueError(
-            "Could not find a 'Case # (Output)' (or fallback) column in the Output Excel. "
-            "Check OUTPUT_COLUMN_CANDIDATES['Case #']."
-        )
-
-    # pre-resolve the citation number column so pair_citations can use it
-    cit_no_col = output_cols.get("Citation Number")
-
-    output_groups = group_output_rows_by_case(output_df, case_col)
-    # attach a normalized helper key for citation-number matching
-    for key, rows in output_groups.items():
-        for row in rows:
-            row["_Citation Number_resolved"] = row.get(cit_no_col, "") if cit_no_col else ""
-
-    result_rows = []
-    case_summary = []
-
-    for html_case in html_cases:
-        case_key = normalize_key(html_case.get("Case #", ""))
-        output_rows_for_case = output_groups.get(case_key, [])
-        found_in_output = bool(output_rows_for_case)
-
-        pairs = pair_citations(html_case.get("Citations", []), output_rows_for_case)
-
-        row_mismatch_count = 0
-        for html_cit, out_row in pairs:
-            row_data = {}
-            mismatched_fields = []
-
-            for field in FIELD_ORDER:
-                if field in SINGLE_FIELDS:
-                    tool_val = html_case.get(field, "")
-                else:
-                    tool_val = html_cit.get(field, "") if html_cit else ""
-
-                output_val = out_row.get(output_cols.get(field), "") if (out_row is not None and output_cols.get(field)) else ""
-
-                status = field_match_status(tool_val, output_val)
-                if status == "Mismatch":
-                    mismatched_fields.append(field)
-
-                row_data[f"{field} (Tool_Input)"] = normalize_value_for_compare(tool_val)
-                row_data[f"{field} (Output)"] = normalize_value_for_compare(output_val)
-                row_data[f"{field} Match"] = status
-
-            if mismatched_fields:
-                row_data["Row Status"] = "Mismatch (" + ", ".join(mismatched_fields) + ")"
-                row_mismatch_count += 1
-            else:
-                row_data["Row Status"] = "Match"
-
-            row_data["_source_html_file"] = html_case.get("_source_file", "")
-            result_rows.append(row_data)
-
-        case_summary.append({
-            "Case #": html_case.get("Case #", ""),
-            "County": html_case.get("County", ""),
-            "Rows Compared": len(pairs),
-            "Rows Matched": len(pairs) - row_mismatch_count if found_in_output else 0,
-            "Rows Mismatched": row_mismatch_count if found_in_output else len(pairs),
-            "Overall Status": "Match" if (found_in_output and row_mismatch_count == 0) else
-                              ("Case Not Found in Output Excel" if not found_in_output else "Mismatch"),
-            "Source HTML File": html_case.get("_source_file", ""),
-        })
-
-    return result_rows, case_summary
-
-
-# ============================================================
-# STEP 4: INPUT EXCEL vs OUTPUT EXCEL -- Case # + County VALIDATION
-# ============================================================
-
-def run_input_vs_output_validation(input_df, output_df):
-    """Returns (comparison_df, not_found_count).
-    not_found_count = number of "No records to display." placeholder rows in
-    the Input Excel (counties the source site returned zero cases for). Those
-    rows are NOT real cases, so they are excluded from comparison_df / the
-    New Case count, but they ARE counted here so the GUI can surface them
-    under NOT FOUND instead of silently dropping them."""
-    if input_df.empty:
-        log.warning("Input Excel is empty/missing - skipping input-vs-output validation.")
-        return pd.DataFrame(), 0
-    if output_df.empty:
-        log.warning("Output Excel is empty/missing - skipping input-vs-output validation.")
-        return pd.DataFrame(), 0
-
-    in_case_col = find_column(input_df.columns, INPUT_COLUMN_CANDIDATES["Case #"])
-    in_county_col = find_column(input_df.columns, INPUT_COLUMN_CANDIDATES["County"])
-
-    output_cols = resolve_output_columns(output_df)
-    out_case_col = output_cols.get("Case #")
-    out_county_col = output_cols.get("County")
-
-    if in_case_col is None or out_case_col is None:
-        raise ValueError("Could not locate a 'Case #' column in the Input and/or Output Excel.")
-
-    output_lookup = {}
-    for _, row in output_df.iterrows():
-        key = normalize_key(row.get(out_case_col, ""))
-        if key and key not in output_lookup:
-            output_lookup[key] = row  # first row per case is enough for case-level County check
-
-    results = []
-    not_found_count = 0
-    for _, in_row in input_df.iterrows():
-        in_case = in_row.get(in_case_col, "")
-        key = normalize_key(in_case)
-
-        if not key:
-            # blank Case # in the Input Excel - nothing to compare, skip this row entirely
-            continue
-
-        if is_no_records_placeholder(in_case):
-            # source site's "no cases found for this county" placeholder row -
-            # not a real case, so it must not be counted as New Case. Still
-            # written into the result sheet (and counted) as "Not Found" so
-            # it's visible in the Excel, not just the console/log.
-            not_found_count += 1
-            county_for_msg = in_row.get(in_county_col, "") if in_county_col else ""
-            msg = f"'No records to display.' placeholder row for county={county_for_msg} -> counted as Not Found"
-            log.info(msg)
-            results.append({
-                "Case #": in_case,
-                "Input County": county_for_msg,
-                "Output County": "",
-                "Case # Status": "Not Found",
-                "County Status": "Not Found",
-                "Source Input File": in_row.get("_source_file", ""),
-                "Notes": msg,
-            })
-            continue
-
-        in_county = in_row.get(in_county_col, "") if in_county_col else ""
-
-        out_row = output_lookup.get(key)
-        if out_row is None:
-            results.append({
-                "Case #": in_case,
-                "Input County": in_county,
-                "Output County": "",
-                "Case # Status": "New Case",
-                "County Status": "New Case",
-                "Source Input File": in_row.get("_source_file", ""),
-                "Notes": "",
-            })
-            continue
-
-        out_county = out_row.get(out_county_col, "") if out_county_col else ""
-        county_status = (
-            "Match"
-            if normalize_value_for_compare(in_county) == normalize_value_for_compare(out_county)
-            else "Mismatch"
-        )
-        results.append({
-            "Case #": in_case,
-            "Input County": in_county,
-            "Output County": out_county,
-            "Case # Status": "Match",
-            "County Status": county_status,
-            "Source Input File": in_row.get("_source_file", ""),
-            "Notes": "",
-        })
-
-    columns = ["Case #", "Input County", "Output County", "Case # Status",
-               "County Status", "Source Input File", "Notes"]
-    result_df = pd.DataFrame(results)
-    if result_df.empty:
-        result_df = pd.DataFrame(columns=columns)
-    else:
-        result_df = result_df[columns]
-    return result_df, not_found_count
-
-
-# ============================================================
-# STEP 5: WRITE RESULTS
-# ============================================================
-
-GREEN_FILL = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-RED_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-HEADER_FILL = PatternFill(start_color="305496", end_color="305496", fill_type="solid")
-HEADER_FONT = Font(color="FFFFFF", bold=True)
-
-
-def _write_df_to_sheet(ws, df, match_col_predicate=None):
-    """
-    match_col_predicate: optional function(col_name) -> bool, marking which
-    columns should be color-coded Match(green)/Mismatch(red).
-    """
-    if df.empty:
-        ws.append(["No records to display."])
-        return
-
-    ws.append(list(df.columns))
-    for cell in ws[1]:
-        cell.fill = HEADER_FILL
-        cell.font = HEADER_FONT
-        cell.alignment = Alignment(horizontal="center")
-
-    if match_col_predicate:
-        status_col_idx = [i for i, c in enumerate(df.columns) if match_col_predicate(c)]
-    else:
-        status_col_idx = []
-
-    for _, row in df.iterrows():
-        ws.append(list(row))
-        r = ws.max_row
-        for idx in status_col_idx:
-            cell = ws.cell(row=r, column=idx + 1)
-            val = str(cell.value or "")
-            if val == "Match":
-                cell.fill = GREEN_FILL
-            elif val.startswith("Mismatch") or val == "Not Found in Output" or "Not Found" in val or val == "New Case":
-                cell.fill = RED_FILL
-
-    for i, col in enumerate(df.columns, start=1):
-        max_len = max([len(str(col))] + [len(str(v)) for v in df[col].astype(str).tolist()])
-        ws.column_dimensions[get_column_letter(i)].width = min(max(10, max_len + 2), 40)
-
-    ws.freeze_panes = "A2"
-
-
-def build_validation_result_df(result_rows):
-    """Build the final DataFrame with columns in the exact required order.
-    Rows where every single Tool_Input AND Output value is blank (nothing
-    extracted from HTML and nothing in the Output Excel) are dropped -
-    they carry no information."""
-    columns = []
-    for field in FIELD_ORDER:
-        columns += [f"{field} (Tool_Input)", f"{field} (Output)", f"{field} Match"]
-    columns += ["Row Status"]
-
-    df = pd.DataFrame(result_rows)
-    for col in columns:
-        if col not in df.columns:
-            df[col] = ""
-    if df.empty:
-        return pd.DataFrame(columns=columns)
-
-    value_cols = [f"{field} (Tool_Input)" for field in FIELD_ORDER] + [f"{field} (Output)" for field in FIELD_ORDER]
-    non_empty_mask = df[value_cols].apply(lambda col: col.astype(str).str.strip() != "").any(axis=1)
-    df = df[non_empty_mask]
-
-    return df[columns]
-
-
-def write_results(result_rows, case_summary, input_output_df, result_dir, output_name_tag="Output"):
-    os.makedirs(result_dir, exist_ok=True)
-    out_path = os.path.join(result_dir, f"{output_name_tag}_Validation_Results.xlsx")
-
-    validation_df = build_validation_result_df(result_rows)
-
-    wb = openpyxl.Workbook()
-    wb.remove(wb.active)
-
-    ws1 = wb.create_sheet("Validation_Result")
-    _write_df_to_sheet(ws1, validation_df, match_col_predicate=lambda c: c.endswith("Match") or c == "Row Status")
-
-    ws3 = wb.create_sheet("Input_vs_Output")
-    _write_df_to_sheet(ws3, input_output_df, match_col_predicate=lambda c: c in ("Case # Status", "County Status"))
-
-    wb.save(out_path)
-    log.info("Results written to %s", out_path)
-    return out_path
-
-
-# ============================================================
-# CORE RUN (used by both the GUI and the CLI fallback)
-# ============================================================
-
-def run_validation(offline_dir, output_dir, input_dir, result_base_dir):
-    """Run the full validation pipeline against the given folders and return
-    a summary dict. Raises on unrecoverable errors (caller should catch)."""
-    log.info("=== GA Probate Validation Tool starting ===")
-
-    html_cases = load_all_html_cases(offline_dir)
-    output_df = load_excel_folder(output_dir)
-    input_df = load_excel_folder(input_dir)
-
-    result_rows, case_summary = build_validation_rows(html_cases, output_df)
-    input_output_df, not_found_cases = run_input_vs_output_validation(input_df, output_df)
-
-    today_str = datetime.now().strftime("%d%m%Y")
-    result_dir = os.path.join(result_base_dir, f"Result_{today_str}")
-
-    output_name_tag = get_output_excel_name_tag(output_dir)
-    out_path = write_results(result_rows, case_summary, input_output_df, result_dir, output_name_tag)
-
-    total_cases = len(case_summary)
-    matched_cases = sum(1 for c in case_summary if c["Overall Status"] == "Match")
-    mismatched_cases = sum(1 for c in case_summary if c["Overall Status"] == "Mismatch")
-
-    # "New Case" = read straight from the Input_vs_Output sheet's "Case # Status"
-    # column (an Input Excel case whose Case # doesn't exist anywhere in Output yet).
-    if not input_output_df.empty and "Case # Status" in input_output_df.columns:
-        new_case_count = int((input_output_df["Case # Status"] == "New Case").sum())
-    else:
-        new_case_count = 0
-
-    # "Not Found" = "No records to display." placeholder rows in the Input
-    # Excel (counties the source site returned zero cases for) - counted by
-    # run_input_vs_output_validation, not part of input_output_df itself.
-
-    log.info(
-        "Done. %d case(s) processed, %d fully matched, %d mismatched, %d new case(s), %d not found (Input_vs_Output).",
-        total_cases, matched_cases, mismatched_cases, new_case_count, not_found_cases,
-    )
-    log.info("Open the results file: %s", out_path)
-
-    return {
-        "out_path": out_path,
-        "result_dir": result_dir,
-        "total_cases": total_cases,
-        "matched_cases": matched_cases,
-        "mismatched_cases": mismatched_cases,
-        "new_case_count": new_case_count,
-        "not_found_cases": not_found_cases,
+    result = {}
+
+    def _capture_done(success, output_path, match_path, stats):
+        result.update(success=success, output_path=output_path,
+                       match_path=match_path, stats=stats)
+        if on_done:
+            on_done(success, output_path, match_path, stats)
+
+    output_folder = os.path.join(job_dir, "Output")
+    offline_folder = os.path.join(job_dir, "Offline")
+    tool_input_folder = os.path.join(job_dir, "Tool_Input")
+    for d in (output_folder, offline_folder, tool_input_folder):
+        ensure_folder(d)
+
+    cfg = {
+        "input_file": input_file_path,
+        "output_folder": output_folder,
+        "offline_folder": offline_folder,
+        "tool_input_folder": tool_input_folder,
+        "compare_file": compare_file,
+        "headless": headless,
+        "limit": limit,
+        "delay_seconds_minimum": delay_min,
+        "delay_seconds_maximum": delay_max,
     }
+    run_live_pipeline(cfg, log, _capture_done)
+    return (result.get("success", False), result.get("output_path"),
+            result.get("match_path"), result.get("stats", {}))
+
+
+def run_validation_job(offline_dir, output_dir, input_dir, result_base_dir, log_callback=None):
+    """Run the Validation pipeline for a web request. All four dirs should
+    already exist and be populated (uploaded offline HTML / Output Excel /
+    Input Excel files) before calling this. Returns the summary dict from
+    run_validation() (out_path, result_dir, total_cases, matched_cases,
+    mismatched_cases, new_case_count, not_found_cases,
+    same_case_diff_county_count). Raises on unrecoverable errors.
+
+    run_validation() below logs via the module-level `log` logger (the
+    same one the original CLI used); if log_callback is given, we also
+    forward every message to it via a temporary logging.Handler, so a
+    Flask route can stream progress (e.g. over SSE) without changing
+    run_validation() itself."""
+    handler = None
+    if log_callback is not None:
+        class _CallbackHandler(logging.Handler):
+            def emit(self, record):
+                try:
+                    log_callback(self.format(record))
+                except Exception:
+                    pass
+        handler = _CallbackHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)-7s  %(message)s"))
+        log.addHandler(handler)
+    try:
+        return run_validation(offline_dir, output_dir, input_dir, result_base_dir)
+    finally:
+        if handler is not None:
+            log.removeHandler(handler)
