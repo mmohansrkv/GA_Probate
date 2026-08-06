@@ -1,504 +1,482 @@
 """
-app.py — LNGA GA Probate Courts web app.
+app.py
+====================================================================
+LNGA / GA Probate Courts Tool — Flask web front-end
+====================================================================
+Wraps the two pipelines in core.py (Citation Search + Validation) as a
+small web app, in place of the original Tkinter desktop GUI:
 
-Wraps core.py's two pipelines (Citation Search live-scrape, and
-offline Validation) behind:
-  - a small web UI (upload a file, click Run, watch the log, download
-    the result workbook), and
-  - a JSON API doing the same thing, for scripted/automated use.
+  /                    home page, choose a module
+  /citation-search     upload a County/Start/End file -> live-scrape
+                        georgiaprobaterecords.com -> download the
+                        Output workbook + Result (Match/New/Missing)
+                        workbook
+  /validation           upload offline HTML case files + Output Excel(s)
+                        + Input Excel/txt -> download the Result
+                        workbook (Validation_Result / Case#_Diff_County /
+                        Input_vs_Output sheets)
+  /jobs/<id>/status     JSON polling endpoint (status + log tail)
+  /jobs/<id>/download/<kind>   download a finished job's output file
 
-Runs are asynchronous: POSTing a job returns a job_id immediately; the
-scrape/validation runs in a background thread while the UI polls
-/api/jobs/<id> for log lines and status. This matters because a full
-Citation Search run over 20+ counties, each paging through a live
-ASP.NET grid, can take several minutes — a synchronous request would
-just time out.
-
-NOTE: the Citation Search feature drives a real (headless) Chrome
-browser against https://georgiaprobaterecords.com/Traffic/SearchCitations.aspx.
-It needs Chrome/Chromium + a matching driver installed in the
-container (see Dockerfile) and outbound network access to that site.
-The Validation feature is fully offline (HTML/Excel files you upload)
-and has no such requirement.
+IMPORTANT — single-process deployment:
+Job state lives in an in-memory dict (JOBS). That only works correctly
+if the app runs as ONE worker process (many threads is fine — see
+render.yaml / the gunicorn command: `--workers 1 --threads 8`). Do not
+scale this service to multiple Render instances/workers without moving
+job state to something shared (Redis, a DB, etc).
+====================================================================
 """
 
-import io
 import os
-import re
+import io
+import uuid
 import shutil
-import tempfile
 import threading
 import traceback
-import uuid
-import zipfile
 from datetime import datetime
 
 from flask import (
-    Flask, request, jsonify, send_file, render_template_string, abort
+    Flask, request, jsonify, send_file, render_template_string, abort,
 )
 from werkzeug.utils import secure_filename
 
 import core
 
+# ------------------------------------------------------------------
+# App / config
+# ------------------------------------------------------------------
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB uploads
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB upload cap
 
-# Where per-job scratch folders + results live on disk. On Render this
-# should point at a mounted persistent disk if you want results to survive
-# a restart; by default it's ephemeral container storage, which is fine
-# since results are meant to be downloaded right after the run.
-DATA_ROOT = os.environ.get("LNGA_DATA_ROOT", "/tmp/lnga_jobs")
-os.makedirs(DATA_ROOT, exist_ok=True)
+JOBS_DIR = os.path.join(core.DATA_DIR, "jobs")
+os.makedirs(JOBS_DIR, exist_ok=True)
 
-# Corporate network share the desktop tool used to keep every uploaded
-# Input file on, so the Validation tool (which reads its own "Input Excel"
-# folder from that same share) always has the latest copy available. Same
-# path the desktop tool's Validation config used for INPUT_EXCEL_DIR.
-# Overridable via env var; on a cloud host like Render this path won't
-# exist, so the copy step below is always best-effort and never blocks
-# the actual Citation Search run if it fails.
-CORP_INPUT_ARCHIVE_DIR = os.environ.get(
-    "LNGA_CORP_INPUT_ARCHIVE_DIR", r"D:\Mohan\GA_Probate\New\Input Folder"
-)
-
-
-_WINDOWS_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:\\")
-
-
-def _archive_input_to_corp_share(input_path, job_id):
-    """Best-effort copy of the uploaded Citation Search input file onto the
-    corp network share so it's available to the Validation tool's Input
-    Excel folder. Never raises — logs success or the reason it was
-    skipped into the job log.
-
-    On a non-Windows host (e.g. a Linux container on Render), a
-    'D:\\...' path isn't a real filesystem location — os.makedirs() on
-    Linux would happily create a bogus local folder literally named
-    'D:\\Mohan\\...' instead of failing, which would be misleading. So
-    that case is detected up front and reported as a skip rather than
-    attempted."""
-    if os.name != "nt" and _WINDOWS_DRIVE_PATH_RE.match(CORP_INPUT_ARCHIVE_DIR):
-        _log(job_id, f"[INFO] Skipped corp-share archive — "
-                      f"'{CORP_INPUT_ARCHIVE_DIR}' is a Windows path and this "
-                      f"server isn't Windows, so it isn't a real location here "
-                      f"(only relevant when running on the office network / a "
-                      f"Windows host with that drive mapped). Continuing with the run.")
-        return None
-    try:
-        os.makedirs(CORP_INPUT_ARCHIVE_DIR, exist_ok=True)
-        dest = os.path.join(CORP_INPUT_ARCHIVE_DIR, os.path.basename(input_path))
-        shutil.copy2(input_path, dest)
-        _log(job_id, f"Archived input file to corp share -> {dest}")
-        return dest
-    except OSError as e:
-        _log(job_id, f"[WARNING] Could not archive input file to corp share "
-                      f"'{CORP_INPUT_ARCHIVE_DIR}' ({type(e).__name__}: {e}) — "
-                      f"this is expected if that path isn't reachable from this "
-                      f"host. Continuing with the run.")
-        return None
-
-# In-memory job registry: {job_id: {...}}. Fine for a single-process
-# deployment (Render's free/starter web service tier); if you scale to
-# multiple instances, swap this for Redis or a DB-backed job table.
+# job_id -> dict(kind, status, log[list], created, error, files{label:path}, stats)
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 
+ALLOWED_INPUT_EXT = {".xlsx", ".xls", ".txt"}
+ALLOWED_HTML_EXT = {".html", ".htm"}
+ALLOWED_EXCEL_EXT = {".xlsx", ".xls"}
 
-# ─────────────────────────────────────────────────────────────────────────
-# Job helpers
-# ─────────────────────────────────────────────────────────────────────────
+
+def _ext_ok(filename, allowed):
+    return os.path.splitext(filename)[1].lower() in allowed
+
+
 def _new_job(kind):
     job_id = uuid.uuid4().hex[:12]
-    job_dir = os.path.join(DATA_ROOT, job_id)
+    job_dir = os.path.join(JOBS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
     with JOBS_LOCK:
         JOBS[job_id] = {
             "id": job_id,
             "kind": kind,
-            "status": "pending",  # pending -> running -> done | error
+            "status": "queued",
             "log": [],
-            "created": datetime.utcnow().isoformat() + "Z",
-            "dir": job_dir,
-            "downloads": {},   # label -> absolute path
-            "stats": {},
+            "created": datetime.now().isoformat(timespec="seconds"),
             "error": None,
+            "files": {},
+            "stats": {},
+            "dir": job_dir,
         }
-    return job_id
+    return job_id, job_dir
 
 
-def _log(job_id, line):
+def _log_fn(job_id):
+    def _log(msg):
+        line = str(msg)
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            if job is not None:
+                for sub in line.splitlines() or [""]:
+                    job["log"].append(sub)
+                # keep the buffer from growing without bound
+                if len(job["log"]) > 5000:
+                    job["log"] = job["log"][-5000:]
+    return _log
+
+
+def _set(job_id, **kv):
     with JOBS_LOCK:
-        JOBS[job_id]["log"].append(str(line))
+        job = JOBS.get(job_id)
+        if job is not None:
+            job.update(kv)
 
 
-def _set_status(job_id, status, **extra):
-    with JOBS_LOCK:
-        JOBS[job_id]["status"] = status
-        JOBS[job_id].update(extra)
+def _save_upload(file_storage, dest_dir, allowed_ext=None):
+    os.makedirs(dest_dir, exist_ok=True)
+    filename = secure_filename(file_storage.filename)
+    if not filename:
+        return None
+    if allowed_ext and not _ext_ok(filename, allowed_ext):
+        return None
+    dest = os.path.join(dest_dir, filename)
+    file_storage.save(dest)
+    return dest
 
 
-def _get_job(job_id):
+# ------------------------------------------------------------------
+# Citation Search
+# ------------------------------------------------------------------
+
+def _run_citation_search(job_id, input_path, compare_path, limit, delay_min, delay_max):
+    log = _log_fn(job_id)
+    _set(job_id, status="running")
+    job_dir = JOBS[job_id]["dir"]
+    try:
+        success, output_path, match_path, stats = core.run_citation_search_job(
+            input_file_path=input_path,
+            job_dir=job_dir,
+            log=log,
+            headless=True,
+            limit=limit,
+            compare_file=compare_path,
+            delay_min=delay_min,
+            delay_max=delay_max,
+        )
+        files = {}
+        if output_path and os.path.exists(output_path):
+            files["output"] = output_path
+        if match_path and os.path.exists(match_path):
+            files["result"] = match_path
+        _set(job_id, status="done" if success else "error", files=files,
+             stats={k: v for k, v in stats.items() if k != "report_df"},
+             error=None if success else "Pipeline reported failure — see log.")
+    except Exception:
+        log("[FATAL] " + traceback.format_exc())
+        _set(job_id, status="error", error=traceback.format_exc().strip().splitlines()[-1])
+
+
+@app.route("/citation-search", methods=["GET", "POST"])
+def citation_search():
+    if request.method == "GET":
+        return render_template_string(CITATION_SEARCH_PAGE)
+
+    input_file = request.files.get("input_file")
+    if input_file is None or not input_file.filename:
+        return render_template_string(CITATION_SEARCH_PAGE,
+                                       error="Please choose a County/Start/End input file (.txt or .xlsx).")
+
+    job_id, job_dir = _new_job("citation_search")
+    uploads_dir = os.path.join(job_dir, "uploads")
+    input_path = _save_upload(input_file, uploads_dir, ALLOWED_INPUT_EXT)
+    if not input_path:
+        return render_template_string(
+            CITATION_SEARCH_PAGE,
+            error="Input file must be .txt, .xlsx, or .xls.")
+
+    compare_path = None
+    compare_file = request.files.get("compare_file")
+    if compare_file and compare_file.filename:
+        compare_path = _save_upload(compare_file, uploads_dir, ALLOWED_EXCEL_EXT)
+
+    limit_raw = (request.form.get("limit") or "").strip()
+    limit = int(limit_raw) if limit_raw.isdigit() else None
+    delay_min = float(request.form.get("delay_min") or 0) or 0.0
+    delay_max = float(request.form.get("delay_max") or 0) or 0.0
+
+    t = threading.Thread(
+        target=_run_citation_search,
+        args=(job_id, input_path, compare_path, limit, delay_min, delay_max),
+        daemon=True,
+    )
+    t.start()
+    return render_template_string(JOB_STATUS_PAGE, job_id=job_id, kind="Citation Search")
+
+
+# ------------------------------------------------------------------
+# Validation
+# ------------------------------------------------------------------
+
+def _run_validation(job_id, offline_dir, output_dir, input_dir, result_dir):
+    log = _log_fn(job_id)
+    _set(job_id, status="running")
+    try:
+        summary = core.run_validation_job(offline_dir, output_dir, input_dir, result_dir,
+                                           log_callback=log)
+        files = {}
+        out_path = summary.get("out_path")
+        if out_path and os.path.exists(out_path):
+            files["result"] = out_path
+        _set(job_id, status="done", files=files, stats=summary)
+    except Exception:
+        log("[FATAL] " + traceback.format_exc())
+        _set(job_id, status="error", error=traceback.format_exc().strip().splitlines()[-1])
+
+
+@app.route("/validation", methods=["GET", "POST"])
+def validation():
+    if request.method == "GET":
+        return render_template_string(VALIDATION_PAGE)
+
+    html_files = request.files.getlist("html_files")
+    output_files = request.files.getlist("output_files")
+    input_files = request.files.getlist("input_files")
+
+    if not any(f.filename for f in html_files):
+        return render_template_string(VALIDATION_PAGE,
+                                       error="Please upload at least one offline .html/.htm case file.")
+    if not any(f.filename for f in output_files):
+        return render_template_string(VALIDATION_PAGE,
+                                       error="Please upload at least one Output Excel (.xlsx) file.")
+
+    job_id, job_dir = _new_job("validation")
+    offline_dir = os.path.join(job_dir, "Offline")
+    output_dir = os.path.join(job_dir, "Output")
+    input_dir = os.path.join(job_dir, "Input")
+    result_dir = os.path.join(job_dir, "Result")
+    for d in (offline_dir, output_dir, input_dir, result_dir):
+        os.makedirs(d, exist_ok=True)
+
+    for f in html_files:
+        if f.filename:
+            _save_upload(f, offline_dir, ALLOWED_HTML_EXT)
+    for f in output_files:
+        if f.filename:
+            _save_upload(f, output_dir, ALLOWED_EXCEL_EXT)
+    for f in input_files:
+        if f.filename:
+            _save_upload(f, input_dir, ALLOWED_INPUT_EXT)
+
+    t = threading.Thread(
+        target=_run_validation,
+        args=(job_id, offline_dir, output_dir, input_dir, result_dir),
+        daemon=True,
+    )
+    t.start()
+    return render_template_string(JOB_STATUS_PAGE, job_id=job_id, kind="Validation")
+
+
+# ------------------------------------------------------------------
+# Job status / download
+# ------------------------------------------------------------------
+
+@app.route("/jobs/<job_id>/status")
+def job_status(job_id):
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         if job is None:
-            return None
-        return dict(job)  # shallow copy for safe read outside the lock
+            abort(404)
+        return jsonify({
+            "id": job["id"],
+            "kind": job["kind"],
+            "status": job["status"],
+            "log": job["log"][-400:],
+            "error": job["error"],
+            "stats": job["stats"],
+            "downloads": sorted(job["files"].keys()),
+        })
 
 
-def _extract_upload_to_dir(file_storage, dest_dir):
-    """Saves an uploaded file into dest_dir. If it's a .zip, extracts its
-    contents into dest_dir instead (so callers can upload a whole folder
-    of offline HTML dumps / Excel files as one .zip)."""
-    os.makedirs(dest_dir, exist_ok=True)
-    filename = secure_filename(file_storage.filename or "upload")
-    if filename.lower().endswith(".zip"):
-        data = io.BytesIO(file_storage.read())
-        with zipfile.ZipFile(data) as zf:
-            zf.extractall(dest_dir)
-    else:
-        file_storage.save(os.path.join(dest_dir, filename))
-    return dest_dir
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# Citation Search (live scrape) job
-# ─────────────────────────────────────────────────────────────────────────
-def _run_citation_search_job(job_id, input_path, opts):
-    def log(msg):
-        _log(job_id, msg)
-
-    def on_done(success, output_path, match_path, stats):
-        if success:
-            downloads = {}
-            if output_path:
-                downloads["result_workbook"] = output_path
-            if match_path:
-                downloads["match_status_workbook"] = match_path
-            _set_status(job_id, "done", downloads=downloads, stats=stats)
-        else:
-            _set_status(job_id, "error", error="Pipeline failed — see log.")
-
-    job = _get_job(job_id)
-    cfg = {
-        "input_file": input_path,
-        "output_folder": os.path.join(job["dir"], "Output"),
-        "offline_folder": os.path.join(job["dir"], "Offline"),
-        "tool_input_folder": os.path.join(job["dir"], "Tool_Input"),
-        "headless": opts.get("headless", True),
-        "limit": opts.get("limit") or 0,
-        "delay_seconds_minimum": opts.get("delay_min", 0),
-        "delay_seconds_maximum": opts.get("delay_max", 0),
-    }
-    core.ensure_folder(cfg["output_folder"])
-    core.ensure_folder(cfg["offline_folder"])
-    core.ensure_folder(cfg["tool_input_folder"])
-
-    _set_status(job_id, "running")
-    try:
-        core.run_live_pipeline(cfg, log, on_done)
-    except Exception:
-        _log(job_id, traceback.format_exc())
-        _set_status(job_id, "error", error="Unhandled exception — see log.")
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# Validation job
-# ─────────────────────────────────────────────────────────────────────────
-def _run_validation_job(job_id, offline_dir, output_dir, input_dir):
-    _set_status(job_id, "running")
-    try:
-        job = _get_job(job_id)
-        result_base = os.path.join(job["dir"], "Result")
-        _log(job_id, "Starting validation...")
-        info = core.run_validation(offline_dir, output_dir, input_dir, result_base)
-        _log(job_id, f"Done. {info['total_cases']} case(s) processed, "
-                      f"{info['matched_cases']} matched, {info['mismatched_cases']} mismatched, "
-                      f"{info['new_case_count']} new, {info['not_found_cases']} not found.")
-        _set_status(job_id, "done",
-                    downloads={"validation_result": info["out_path"]},
-                    stats=info)
-    except Exception:
-        _log(job_id, traceback.format_exc())
-        _set_status(job_id, "error", error="Validation failed — see log.")
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# API routes
-# ─────────────────────────────────────────────────────────────────────────
-@app.route("/api/citation-search", methods=["POST"])
-def api_citation_search():
-    """multipart/form-data:
-       input_file    (required) - .txt or .xlsx: County / Starting Date / Ending Date
-       headless      (optional, default true)
-       limit         (optional) - only process the first N counties (testing)
-       delay_min / delay_max (optional) - seconds to sleep between counties
-
-    Match/New/Missing case-number validation against an existing baseline
-    still runs automatically (see core.find_compare_file) if a case-number
-    workbook is sitting in the job's Tool Input folder — there's just no
-    per-request upload field for it anymore.
-    """
-    if not core.SELENIUM_AVAILABLE:
-        return jsonify(error=("selenium is not installed in this deployment — "
-                               "the Citation Search feature is unavailable.")), 503
-    if "input_file" not in request.files or request.files["input_file"].filename == "":
-        return jsonify(error="input_file is required (.txt or .xlsx)"), 400
-
-    job_id = _new_job("citation_search")
-    job = _get_job(job_id)
-
-    input_path = os.path.join(job["dir"], secure_filename(request.files["input_file"].filename))
-    request.files["input_file"].save(input_path)
-    _archive_input_to_corp_share(input_path, job_id)
-
-    opts = {
-        "headless": request.form.get("headless", "true").lower() != "false",
-        "limit": request.form.get("limit", type=int) or 0,
-        "delay_min": request.form.get("delay_min", type=float) or 0,
-        "delay_max": request.form.get("delay_max", type=float) or 0,
-    }
-
-    t = threading.Thread(target=_run_citation_search_job,
-                          args=(job_id, input_path, opts), daemon=True)
-    t.start()
-    return jsonify(job_id=job_id), 202
-
-
-@app.route("/api/validate", methods=["POST"])
-def api_validate():
-    """multipart/form-data:
-       offline  (required) - .zip of debug_<county>.html offline dumps
-       output   (required) - .zip of Output Excel workbook(s) (or a single .xlsx)
-       input    (required) - .zip of Input Excel workbook(s) (or a single .xlsx)
-    """
-    for field in ("offline", "output", "input"):
-        if field not in request.files or request.files[field].filename == "":
-            return jsonify(error=f"'{field}' file is required"), 400
-
-    job_id = _new_job("validation")
-    job = _get_job(job_id)
-
-    offline_dir = _extract_upload_to_dir(request.files["offline"], os.path.join(job["dir"], "Offline"))
-    output_dir = _extract_upload_to_dir(request.files["output"], os.path.join(job["dir"], "Output"))
-    input_dir = _extract_upload_to_dir(request.files["input"], os.path.join(job["dir"], "Input"))
-
-    t = threading.Thread(target=_run_validation_job,
-                          args=(job_id, offline_dir, output_dir, input_dir), daemon=True)
-    t.start()
-    return jsonify(job_id=job_id), 202
-
-
-@app.route("/api/jobs/<job_id>", methods=["GET"])
-def api_job_status(job_id):
-    job = _get_job(job_id)
-    if job is None:
-        abort(404)
-    return jsonify({
-        "id": job["id"],
-        "kind": job["kind"],
-        "status": job["status"],
-        "log": job["log"],
-        "stats": job["stats"],
-        "error": job["error"],
-        "downloads": sorted(job["downloads"].keys()),
-    })
-
-
-@app.route("/api/jobs/<job_id>/download/<label>", methods=["GET"])
-def api_job_download(job_id, label):
-    job = _get_job(job_id)
-    if job is None or label not in job["downloads"]:
-        abort(404)
-    path = job["downloads"][label]
-    if not os.path.isfile(path):
+@app.route("/jobs/<job_id>/download/<kind>")
+def job_download(job_id, kind):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job is None:
+            abort(404)
+        path = job["files"].get(kind)
+    if not path or not os.path.exists(path):
         abort(404)
     return send_file(path, as_attachment=True, download_name=os.path.basename(path))
 
 
+@app.route("/jobs/<job_id>/cleanup", methods=["POST"])
+def job_cleanup(job_id):
+    """Optional: delete a finished job's files from disk to free space."""
+    with JOBS_LOCK:
+        job = JOBS.pop(job_id, None)
+    if job:
+        shutil.rmtree(job["dir"], ignore_errors=True)
+    return jsonify({"deleted": bool(job)})
+
+
+# ------------------------------------------------------------------
+# Home
+# ------------------------------------------------------------------
+
+@app.route("/")
+def home():
+    return render_template_string(HOME_PAGE)
+
+
 @app.route("/healthz")
 def healthz():
-    return jsonify(status="ok", selenium_available=core.SELENIUM_AVAILABLE)
+    return jsonify({"status": "ok"})
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Web UI (single page, vanilla JS polling — no separate templates/ dir)
-# ─────────────────────────────────────────────────────────────────────────
-INDEX_HTML = """
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>LNGA GA Probate Courts</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+# ------------------------------------------------------------------
+# Inline templates (kept in this file so the deployable file set stays
+# exactly app.py / core.py / requirements.txt / render.yaml / README.md)
+# ------------------------------------------------------------------
+
+BASE_CSS = """
 <style>
-  :root { --accent:#185FA5; --ink:#1A1A1A; --sub:#6B7280; --bg:#F7F8FA; --card:#fff; --border:#E5E7EB; }
-  body { font-family: -apple-system, Segoe UI, Arial, sans-serif; background:var(--bg); color:var(--ink); margin:0; }
-  header { background:#1D3A6A; color:#fff; padding:18px 28px; }
-  header h1 { margin:0; font-size:20px; }
-  main { max-width:920px; margin:24px auto; padding:0 16px; }
-  .tabs { display:flex; gap:8px; margin-bottom:16px; }
-  .tab { padding:10px 18px; border-radius:8px 8px 0 0; background:var(--border); color:var(--sub); cursor:pointer; font-weight:600; }
-  .tab.active { background:var(--card); color:var(--accent); }
-  .card { background:var(--card); border:1px solid var(--border); border-radius:0 8px 8px 8px; padding:20px; }
-  .panel { display:none; } .panel.active { display:block; }
-  label { display:block; font-size:13px; font-weight:600; margin:14px 0 4px; }
-  input[type=file], input[type=number], input[type=text] { width:100%; padding:8px; border:1px solid var(--border); border-radius:6px; box-sizing:border-box; }
-  .row { display:flex; gap:16px; } .row > div { flex:1; }
-  button { margin-top:18px; background:var(--accent); color:#fff; border:none; padding:10px 20px; border-radius:6px; font-weight:600; cursor:pointer; }
-  button:disabled { opacity:.5; cursor:default; }
-  .hint { color:var(--sub); font-size:12px; margin-top:4px; }
-  pre#log { background:#1E2330; color:#D1FAE5; padding:14px; border-radius:8px; max-height:320px; overflow:auto; font-size:12px; margin-top:18px; white-space:pre-wrap; }
-  #downloads a { display:inline-block; margin:10px 10px 0 0; background:#EAF3DE; color:#276221; padding:8px 14px; border-radius:6px; text-decoration:none; font-weight:600; }
-  .status { font-weight:700; margin-top:14px; }
-  .status.error { color:#9C0006; } .status.done { color:#276221; } .status.running,.status.pending { color:#7F3F00; }
-  .checkline { display:flex; align-items:center; gap:8px; margin-top:14px; }
+  :root{--bg:#F7F8FA;--card:#fff;--accent:#185FA5;--accent-hover:#1D3A6A;
+        --border:#E5E7EB;--text:#1A1A1A;--muted:#6B7280;--log-bg:#1E2330;
+        --ok:#276221;--err:#9C0006;}
+  *{box-sizing:border-box}
+  body{background:var(--bg);color:var(--text);font-family:"Segoe UI",Arial,sans-serif;
+       margin:0;padding:0 20px 60px;}
+  header{padding:36px 0 8px;text-align:center}
+  header h1{margin:0;font-size:26px}
+  header p{color:var(--muted);margin:6px 0 0}
+  .wrap{max-width:760px;margin:0 auto}
+  .cards{display:flex;gap:24px;margin-top:28px;flex-wrap:wrap;justify-content:center}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:10px;
+        padding:22px;flex:1 1 280px;max-width:340px}
+  .card h2{margin-top:0;font-size:17px}
+  .card p{color:var(--muted);font-size:13px;min-height:54px}
+  a.btn,button.btn{display:inline-block;background:var(--accent);color:#fff;border:none;
+      padding:10px 18px;border-radius:6px;text-decoration:none;font-weight:600;
+      cursor:pointer;font-size:14px}
+  a.btn:hover,button.btn:hover{background:var(--accent-hover)}
+  form{background:var(--card);border:1px solid var(--border);border-radius:10px;
+       padding:24px;margin-top:20px}
+  label{display:block;font-weight:600;font-size:13px;margin:14px 0 6px}
+  input[type=file],input[type=number],input[type=text]{width:100%;padding:8px;
+      border:1px solid var(--border);border-radius:6px;font-size:13px}
+  .hint{color:var(--muted);font-size:12px;margin-top:4px}
+  .error{background:#FCEBEB;color:var(--err);padding:10px 14px;border-radius:6px;
+         font-size:13px;margin-top:14px}
+  .row2{display:flex;gap:16px}
+  .row2>div{flex:1}
+  #log{background:var(--log-bg);color:#D1FAE5;font-family:Consolas,monospace;
+       font-size:12.5px;padding:16px;border-radius:8px;height:340px;overflow-y:auto;
+       white-space:pre-wrap;margin-top:16px}
+  .status{font-weight:700;margin-top:18px}
+  .status.done{color:var(--ok)} .status.error{color:var(--err)} .status.running{color:var(--accent)}
+  .downloads{margin-top:14px}
+  .downloads a{margin-right:12px}
+  nav{text-align:center;margin-top:8px}
+  nav a{color:var(--accent);text-decoration:none;font-size:13px;margin:0 8px}
 </style>
-</head>
-<body>
-<header><h1>LNGA GA Probate Courts</h1></header>
-<main>
-  <div class="tabs">
-    <div class="tab active" data-tab="citation">Citation Search</div>
-    <div class="tab" data-tab="validation">Validation</div>
+"""
+
+HOME_PAGE = BASE_CSS + """
+<header>
+  <h1>LNGA Probate Courts</h1>
+  <p>Combined Tool — web edition</p>
+</header>
+<div class="wrap">
+  <div class="cards">
+    <div class="card">
+      <h2>🔎 Citation Search</h2>
+      <p>Live-scrapes georgiaprobaterecords.com for every County/Start/End
+         row in an uploaded file and builds Output / Result workbooks.</p>
+      <a class="btn" href="/citation-search">Open ▶</a>
+    </div>
+    <div class="card">
+      <h2>✅ Validation</h2>
+      <p>Compares offline HTML case files against an Output Excel and
+         flags field-by-field mismatches.</p>
+      <a class="btn" href="/validation">Open ▶</a>
+    </div>
   </div>
+</div>
+"""
 
-  <div class="card">
-    <div class="panel active" id="panel-citation">
-      <form id="form-citation">
-        <label>Input file (.txt or .xlsx — County / Starting Date / Ending Date)</label>
-        <input type="file" name="input_file" required>
-        <div class="hint">Tab-separated .txt or Excel, same columns as your weekly county list. A copy is
-        also archived to the corp share (<code>D:\\Mohan\\GA_Probate\\New\\Input Folder</code>) so it's
-        available to the Validation tool, if that path is reachable from this server.</div>
+CITATION_SEARCH_PAGE = BASE_CSS + """
+<header><h1>🔎 Citation Search</h1><p>Upload the County / Starting Date / Ending Date file</p></header>
+<nav><a href="/">&larr; Home</a></nav>
+<div class="wrap">
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  <form method="post" enctype="multipart/form-data">
+    <label>Input file (County / Starting Date / Ending Date — .txt or .xlsx)</label>
+    <input type="file" name="input_file" accept=".txt,.xlsx,.xls" required>
+    <div class="hint">Tab-separated .txt header row: County&#9;Starting Date&#9;Ending Date
+      (dates DD-MM-YYYY), or an .xlsx with the same columns.</div>
 
-        <div class="row">
-          <div>
-            <label>Limit counties (optional, for testing)</label>
-            <input type="number" name="limit" min="0" placeholder="e.g. 3">
-          </div>
-          <div>
-            <label>Delay between counties: min / max seconds</label>
-            <div class="row">
-              <input type="number" name="delay_min" min="0" step="0.5" placeholder="0">
-              <input type="number" name="delay_max" min="0" step="0.5" placeholder="0">
-            </div>
-          </div>
-        </div>
+    <label>Existing case-number workbook to compare against (optional)</label>
+    <input type="file" name="compare_file" accept=".xlsx,.xls">
+    <div class="hint">An .xlsx with a "Case #" column. If omitted, this run's own results
+      are saved as a fresh baseline for next time.</div>
 
-        <div class="checkline">
-          <input type="checkbox" name="headless" id="headless" checked>
-          <label for="headless" style="margin:0;">Run headless (unchecked = only relevant for local debugging)</label>
-        </div>
-
-        <button type="submit">Run Citation Search</button>
-      </form>
+    <div class="row2">
+      <div>
+        <label>Limit counties (optional, for a quick test run)</label>
+        <input type="number" name="limit" min="1" placeholder="e.g. 3">
+      </div>
+      <div>
+        <label>Delay between counties, seconds (optional)</label>
+        <input type="text" name="delay_min" placeholder="min, e.g. 1">
+      </div>
+      <div>
+        <input type="text" name="delay_max" placeholder="max, e.g. 3" style="margin-top:27px">
+      </div>
     </div>
 
-    <div class="panel" id="panel-validation">
-      <form id="form-validation">
-        <label>Offline HTML folder (.zip of debug_&lt;county&gt;.html files)</label>
-        <input type="file" name="offline" accept=".zip" required>
+    <div style="margin-top:20px"><button class="btn" type="submit">Run Citation Search ▶</button></div>
+  </form>
+</div>
+"""
 
-        <label>Output Excel folder (.zip, or a single .xlsx)</label>
-        <input type="file" name="output" required>
+VALIDATION_PAGE = BASE_CSS + """
+<header><h1>✅ Validation</h1><p>Offline HTML case files vs Output Excel</p></header>
+<nav><a href="/">&larr; Home</a></nav>
+<div class="wrap">
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  <form method="post" enctype="multipart/form-data">
+    <label>Offline case HTML files (.html/.htm) — select all that apply</label>
+    <input type="file" name="html_files" accept=".html,.htm" multiple required>
 
-        <label>Input Excel folder (.zip, or a single .xlsx)</label>
-        <input type="file" name="input" required>
+    <label>Output Excel file(s) (.xlsx)</label>
+    <input type="file" name="output_files" accept=".xlsx,.xls" multiple required>
 
-        <button type="submit">Run Validation</button>
-      </form>
-    </div>
+    <label>Input Excel/txt file(s) (optional — enables Input_vs_Output check)</label>
+    <input type="file" name="input_files" accept=".xlsx,.xls,.txt" multiple>
 
-    <div class="status" id="status"></div>
-    <div id="downloads"></div>
-    <pre id="log" style="display:none;"></pre>
-  </div>
-</main>
+    <div style="margin-top:20px"><button class="btn" type="submit">Run Validation ▶</button></div>
+  </form>
+</div>
+"""
 
+JOB_STATUS_PAGE = BASE_CSS + """
+<header><h1>{{ kind }}</h1><p>Job <code>{{ job_id }}</code></p></header>
+<nav><a href="/">&larr; Home</a></nav>
+<div class="wrap">
+  <div id="status" class="status">Starting…</div>
+  <div id="downloads" class="downloads"></div>
+  <div id="log">Waiting for log output…</div>
+</div>
 <script>
-document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => {
-  document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
-  document.querySelectorAll(".panel").forEach(x => x.classList.remove("active"));
-  t.classList.add("active");
-  document.getElementById("panel-" + t.dataset.tab).classList.add("active");
-}));
+const jobId = "{{ job_id }}";
+const statusEl = document.getElementById("status");
+const logEl = document.getElementById("log");
+const dlEl = document.getElementById("downloads");
 
-let poller = null;
-
-function resetOutput() {
-  document.getElementById("status").className = "status";
-  document.getElementById("status").textContent = "";
-  document.getElementById("downloads").innerHTML = "";
-  document.getElementById("log").style.display = "none";
-  document.getElementById("log").textContent = "";
-  if (poller) clearInterval(poller);
-}
-
-function poll(jobId) {
-  poller = setInterval(async () => {
-    const r = await fetch("/api/jobs/" + jobId);
-    const data = await r.json();
-    document.getElementById("log").style.display = "block";
-    document.getElementById("log").textContent = data.log.join("\\n");
-    document.getElementById("log").scrollTop = 1e9;
-    const statusEl = document.getElementById("status");
-    statusEl.textContent = "Status: " + data.status;
+async function poll() {
+  try {
+    const res = await fetch(`/jobs/${jobId}/status`);
+    const data = await res.json();
+    statusEl.textContent = "Status: " + data.status + (data.error ? " — " + data.error : "");
     statusEl.className = "status " + data.status;
-    if (data.status === "done" || data.status === "error") {
-      clearInterval(poller);
-      const dl = document.getElementById("downloads");
-      dl.innerHTML = "";
-      (data.downloads || []).forEach(label => {
-        const a = document.createElement("a");
-        a.href = "/api/jobs/" + jobId + "/download/" + label;
-        a.textContent = "Download: " + label;
-        dl.appendChild(a);
-      });
-      if (data.error) {
-        statusEl.textContent += " — " + data.error;
-      }
-    }
-  }, 1500);
-}
+    logEl.textContent = data.log.join("\\n") || "Waiting for log output…";
+    logEl.scrollTop = logEl.scrollHeight;
 
-async function submitForm(formId, url) {
-  const form = document.getElementById(formId);
-  form.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    resetOutput();
-    const btn = form.querySelector("button");
-    btn.disabled = true;
-    try {
-      const fd = new FormData(form);
-      if (form.querySelector("[name=headless]")) {
-        fd.set("headless", form.querySelector("[name=headless]").checked ? "true" : "false");
-      }
-      const r = await fetch(url, { method: "POST", body: fd });
-      const data = await r.json();
-      if (!r.ok) {
-        document.getElementById("status").className = "status error";
-        document.getElementById("status").textContent = data.error || "Request failed.";
-        return;
-      }
-      poll(data.job_id);
-    } finally {
-      btn.disabled = false;
+    dlEl.innerHTML = "";
+    (data.downloads || []).forEach(kind => {
+      const a = document.createElement("a");
+      a.className = "btn";
+      a.href = `/jobs/${jobId}/download/${kind}`;
+      a.textContent = "Download " + kind;
+      dlEl.appendChild(a);
+    });
+
+    if (data.status === "running" || data.status === "queued") {
+      setTimeout(poll, 1500);
     }
-  });
+  } catch (e) {
+    statusEl.textContent = "Lost connection to server — retrying…";
+    setTimeout(poll, 3000);
+  }
 }
-submitForm("form-citation", "/api/citation-search");
-submitForm("form-validation", "/api/validate");
+poll();
 </script>
-</body>
-</html>
 """
 
 
-@app.route("/")
-def index():
-    return render_template_string(INDEX_HTML)
-
-
 if __name__ == "__main__":
+    # Local dev only. On Render, gunicorn serves the app (see render.yaml).
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=True)
